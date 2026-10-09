@@ -1,0 +1,11 @@
+{
+  "name": "dieci-compiler",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

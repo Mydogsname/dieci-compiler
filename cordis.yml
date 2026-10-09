@@ -1,0 +1,4 @@
+# cordis.yml
+- insert:
+    - id: my-hello-plugin
+      name: 'file:///D:/deepseek-harness/my-plugin/src/hello.js'
