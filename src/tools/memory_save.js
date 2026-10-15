@@ -4,7 +4,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 
 const WIN_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i
 
-function toSafeName(title) {
+export function toSafeName(title) {
     let name = String(title ?? '')
         .replace(/^(记一下|保存|存起来|记住|记录)[：:\s]*/, '')
         .replace(/[\\/:*?"<>|\r\n\t]/g, '_')
@@ -21,11 +21,11 @@ function toSafeName(title) {
     return name
 }
 
-function oneLine(s) {
+export function oneLine(s) {
     return String(s ?? '').replace(/\s*\r?\n\s*/g, ' ').trim()
 }
 
-function normalizeBody(s) {
+export function normalizeBody(s) {
     return String(s ?? '')
         .replace(/\r\n?/g, '\n')
         .replace(/\n{3,}/g, '\n\n')
@@ -33,7 +33,7 @@ function normalizeBody(s) {
 }
 
 /** 在 baseDir 下找一个不冲突的文件路径：base.txt → base-2.txt → base-3.txt ... */
-async function uniquePath(baseDir, base, ext) {
+export async function uniquePath(baseDir, base, ext) {
     let p = path.join(baseDir, `${base}${ext}`)
     let i = 2
     while (true) {
@@ -50,14 +50,26 @@ async function uniquePath(baseDir, base, ext) {
 export function makeMemorySaveTool({ ctx, subdir = '记忆', fallbackWorkspace } = {}) {
     return defineTool({
         name: 'memory_save',
-        description: `把内容保存到工作区的记忆目录。每次回答完，如果这次对话产生了值得保留的内容，就调用它。
+        description: `把内容保存到工作区的记忆目录。
+【什么时候必须调用】不要凭"值不值得"的感觉判断，改成按清单执行 —— 本轮只要出现下面任意一条就存：
+① 新结论（分析或推理得出的明确判断）
+② 新决定（方案选择、优先级、排期、取舍）
+③ 新事实 / 数据 / 定义 / 术语
+④ 新约束或规则（约定、格式、边界、不能做的事）
+⑤ 用户纠正了你（含推翻既有结论）
+⑥ 你纠正了自己的错误（含定位出的根因）
 
-保存规则：
-- 原样保存，不整理，不改格式
+【每轮回答末尾必须报告一行记忆状态】——这是写给用户看的一行字，不是工具调用：
+- 存了：本轮记忆：已存 <标题>
+- 没存：本轮记忆：未存（原因）
+漏报等于漏存：用户看不到这一行，就无从发现漏存。
+
+【保存规则】
+- 原样保存，不整理，不改格式（用户的原话必须原样保留）
 - 只保存有实质内容的部分，不保存寒暄、确认、过渡语
-- 如果这次回答只是闲聊、确认、没有新内容，不要调用
+- 纯闲聊、纯确认、只有工具执行结果而没有新结论时不要调用
 
-用户说"记一下""保存""存起来"，或者 AI 判断这次回答有值得保留的内容时调用。`,
+用户说"记一下""保存""存起来"时无条件调用，即使你认为不值得存。`,
 
         parameters: {
             title: {
@@ -180,4 +192,103 @@ export function makeMemorySaveTool({ ctx, subdir = '记忆', fallbackWorkspace }
             }
         }
     })
+}
+
+/**
+ * 漏存防线：订阅 session/event，在 turn 结束时检查本轮有没有调用过 memory_save。
+ * 有实质输出却整轮没调用时，往 <工作区>/记忆/_待补.md 追加一行。
+ *
+ * 只能发现"整轮漏存"，发现不了"存得太少 / 存错"——那部分靠工具描述里的六条清单
+ * 和"每轮报告记忆状态"兜。它也不会区分 memory_save 是否执行成功（只看有没有调用）。
+ */
+export function registerTurnMemoryCheck(ctx, { subdir = '记忆', minChars = 200 } = {}) {
+    if (typeof ctx?.on !== 'function') return
+    /** sessionId → { turn, saved, chars } */
+    const states = new Map()
+
+    ctx.on('session/event', (session, event) => {
+        try {
+            const id = session?.id
+            const type = event?.type
+            if (!id || !type) return
+
+            let state = states.get(id)
+            if (!state) {
+                state = { turn: 0, saved: false, chars: 0 }
+                states.set(id, state)
+            }
+
+            if (type === 'turn/start') {
+                state.turn = event.data?.turn ?? state.turn + 1
+                state.saved = false
+                state.chars = 0
+                return
+            }
+
+            if (type === 'tool/call') {
+                if (event.data?.name === 'memory_save') state.saved = true
+                return
+            }
+
+            if (type === 'assistant/message') {
+                state.chars += assistantTextLength(event.data?.message)
+                return
+            }
+
+            if (type === 'turn/end') {
+                if (event.data?.reason?.kind !== 'completed') return   // 中断/出错/阻塞不算漏
+                if (state.saved || state.chars < minChars) return
+                const pending = { turn: state.turn, chars: state.chars }
+                state.saved = true   // 同一轮只记一次
+                void appendPending(session, pending, subdir)
+            }
+        } catch (err) {
+            console.warn('[memory-check] 检查失败：', err?.message ?? err)
+        }
+    })
+}
+
+/** 累加一条 assistant/message 的可见文本长度（块数组 / 字符串都容错） */
+function assistantTextLength(message) {
+    const content = message?.content
+    if (typeof content === 'string') return content.length
+    if (!Array.isArray(content)) return 0
+    let n = 0
+    for (const block of content) {
+        if (typeof block === 'string') n += block.length
+        else if (typeof block?.text === 'string') n += block.text.length
+        else if (typeof block?.content === 'string') n += block.content.length
+    }
+    return n
+}
+
+/** 把"本轮漏存"追加到 <工作区>/记忆/_待补.md */
+async function appendPending(session, { turn, chars }, subdir) {
+    try {
+        const cwd = session?.header?.cwd
+        if (!cwd || !path.isAbsolute(cwd)) return
+        const dir = path.join(cwd, subdir)
+        await fs.mkdir(dir, { recursive: true })
+
+        const file = path.join(dir, '_待补.md')
+        const line = `- ${new Date().toISOString()}｜轮次 ${turn}｜约 ${chars} 字｜会话 ${session.id}：本轮有实质输出但没保存记忆\n`
+
+        let exists = true
+        try {
+            await fs.access(file)
+        } catch {
+            exists = false
+        }
+
+        if (exists) {
+            await fs.appendFile(file, line, 'utf-8')
+        } else {
+            const head = '# 待补记忆\n\n'
+                + '> 插件自动追加：这些轮次出现了实质内容却没有调用 memory_save。\n'
+                + '> 补存（或确认不需要存）之后，把对应行删掉。\n\n'
+            await fs.writeFile(file, head + line, 'utf-8')
+        }
+    } catch (err) {
+        console.warn('[memory-check] 写入 _待补.md 失败：', err?.message ?? err)
+    }
 }
