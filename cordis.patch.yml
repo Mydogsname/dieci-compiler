@@ -1,6 +1,5 @@
 - insert:
     - id: dieci-compiler
-      name: 'file:///D:/deepseek-harness/my-plugin/src/index.js'
+      name: dieci-compiler
       config:
-        workspace: 'D:/deepseek-harness'
         memorySubdir: '记忆'

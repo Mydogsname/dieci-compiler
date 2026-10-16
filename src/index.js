@@ -2,7 +2,7 @@ import { makeMemorySaveTool, registerTurnMemoryCheck } from './tools/memory_save
 import { makeAnnotateTool } from './tools/annotate.js'
 import { makeParsePromptTool } from './tools/parse_prompt.js'
 import { makeFindSourcesTool } from './tools/find_sources.js'
-import { registerSaveCommand, registerSaveMemoryCommand } from './save_command.js'
+import { registerSaveCommand, registerDieciCommand } from './save_command.js'
 import { DIECI_GUIDE } from './guide.js'
 
 export const name = 'dieci-compiler'
@@ -43,9 +43,11 @@ export function apply(ctx, config = {}) {
   // 漏存防线：turn 结束时检查本轮有没有漏存记忆（写 记忆/_待补.md）
   registerTurnMemoryCheck(ctx, { subdir })
 
-  // 用户主动保存：/save（最近一条回答）+ /save-memory（界面按钮按 id 存）
+  // 用户主动保存：/save（最近一条回答）
   registerSaveCommand(ctx, { subdir })
-  registerSaveMemoryCommand(ctx, { subdir })
+
+  // /dieci <主题>：建骨架 + 把成文任务派给模型
+  registerDieciCommand(ctx, { subdir })
 
   // 系统提示段落：让每个会话默认明白叠词工作流的思路
   // 写法 A（优雅降级）：宿主没有 systemPrompt 服务时，其余工具照常工作

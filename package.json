@@ -1,8 +1,16 @@
 {
   "name": "dieci-compiler",
   "version": "1.0.0",
+  "description": "叠词：总结本地文件生成注释格式的提示词",
   "type": "module",
   "main": "src/index.js",
+  "license": "MIT",
+  "files": [
+    "src/**/*.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
