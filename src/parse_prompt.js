@@ -7,8 +7,9 @@
  *   注释：            区标记，全角冒号，独占一行
  *   词：内容          注释条目（词 = 2-12 个中文/字母/数字/下划线，无标点空格，顶格）
  *     缩进 2 空格     上一条目的续行（续行 ≠ 条目；条目顶格，续行 ≥2 空格）
- *   出处：            可选区标记（同样独占一行）
- *   词 ← 依据         出处条目
+ *
+ * 引用写在注释内容里（「见 文件:行」）。旧的「出处：」区已废弃：
+ * 仍识别为终止标记，其内容不再解析，只产生一条警告。
  *
  * 无损保证：serialize(parse(text)._lines, lineEnding) === text（同质行尾文件逐字节还原）。
  */
@@ -18,8 +19,6 @@ export const RE_WORD = /^[\u4e00-\u9fa5A-Za-z0-9_]{2,12}$/u
 const WORD_PART = '[一-龥A-Za-z0-9_]{2,12}'
 // 合法条目行：严格词 + 全角/半角冒号 + 内容
 const RE_ENTRY = new RegExp(`^(${WORD_PART})[：:]\\s*(.*)$`, 'u')
-// 合法出处行：严格词 + ← + 依据
-const RE_SOURCE = new RegExp(`^(${WORD_PART})\\s*←\\s*(.*)$`, 'u')
 // 续行：≥2 空格开头
 const RE_CONT = /^\s{2,}(.*)$/
 // "看起来像条目"的宽松检测（用于把词不合规的行挑出来报警）
@@ -130,25 +129,19 @@ export function parsePrompt(text) {
 
     const ok = markerLine >= 0
 
-    // ── 按标记位置排序切段（兼容「出处：」在「注释：」之前的文件）──
-    const markers = []
-    if (markerLine >= 0) markers.push({ line: markerLine, type: 'comment' })
-    if (sourceMarkerLine >= 0) markers.push({ line: sourceMarkerLine, type: 'source' })
-    markers.sort((a, b) => a.line - b.line)
-
+    // 注释区从「注释：」下一行到文件末尾；旧的「出处：」若出现在其后，只作终止标记。
     const bodyStart = titleLine + 1
-    const bodyEnd = markers.length ? markers[0].line : n
+    const bodyEnd = markerLine >= 0 ? markerLine : n
     const bodyLines = lines.slice(bodyStart, bodyEnd)
     const body = bodyLines.join(eol)
 
-    let commentRange = null
-    let sourceRange = null
-    for (let k = 0; k < markers.length; k++) {
-        const start = markers[k].line + 1
-        const end = k + 1 < markers.length ? markers[k + 1].line : n
-        if (markers[k].type === 'comment') commentRange = [start, end]
-        else sourceRange = [start, end]
+    const legacySourceLine = sourceMarkerLine > markerLine ? sourceMarkerLine : -1
+    if (legacySourceLine >= 0) {
+        warnings.push(`第 ${legacySourceLine + 1} 行的「出处：」区已废弃，内容不再解析；引用请写进注释内容（见 文件:行）`)
     }
+    const commentRange = markerLine >= 0
+        ? [markerLine + 1, legacySourceLine >= 0 ? legacySourceLine : n]
+        : null
 
     // ── 正文里形如条目的行 → 提示位置可能放错 ──
     // 长度闸门：中文散文里"短句：展开"很常见，整行 ≤30 字才警告（真误放通常是短行）
@@ -186,7 +179,7 @@ export function parsePrompt(text) {
 
             const m = raw.match(RE_ENTRY)
             if (m) {
-                current = { word: m[1], content: m[2].trim(), lines: [i], basis: '', basisLine: -1 }
+                current = { word: m[1], content: m[2].trim(), lines: [i] }
                 comments.push(current)
                 continue
             }
@@ -218,33 +211,7 @@ export function parsePrompt(text) {
         }
     }
 
-    // ── 解析出处区，把依据挂到同名注释条目上 ──
-    if (sourceRange) {
-        const byWord = new Map(comments.map(c => [c.word, c]))
-        for (let i = sourceRange[0]; i < sourceRange[1]; i++) {
-            const raw = lines[i]
-            const trimmed = raw.trim()
-            if (trimmed === '') continue
-            // 段内再次出现的区标记行：原样保留
-            if (trimmed === '注释：' || trimmed === '出处：') continue
-
-            const m = trimmed.match(RE_SOURCE)
-            if (m) {
-                const entry = byWord.get(m[1])
-                if (entry && !entry.basis) {
-                    entry.basis = m[2].trim()
-                    entry.basisLine = i
-                } else if (!entry) {
-                    unparsed.push({ line: i + 1, text: raw, reason: '出处条目没有对应注释词', section: 'source' })
-                }
-                continue
-            }
-            unparsed.push({ line: i + 1, text: raw, reason: '无法识别的行', section: 'source' })
-        }
-    }
-
     const pending = comments.filter(c => !c.content.trim()).map(c => c.word)
-    const noBasis = comments.filter(c => !c.basis).map(c => c.word)
 
     return {
         ok,
@@ -258,14 +225,12 @@ export function parsePrompt(text) {
         comments,
         unparsed,
         pending,
-        noBasis,
+
         markerCount,
         markerLine,
         commentLines: commentRange ? lines.slice(commentRange[0], commentRange[1]) : [],
         commentRange,
-        sourceLines: sourceRange ? lines.slice(sourceRange[0], sourceRange[1]) : [],
-        sourceRange,
-        sourceMarkerLine,
+        legacySourceLine,
         lineEnding,
         warnings,
         _lines: lines

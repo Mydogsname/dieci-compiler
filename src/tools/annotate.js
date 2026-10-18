@@ -3,6 +3,8 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parsePrompt, serialize, RE_WORD } from '../parse_prompt.js'
+import { extractRefs, checkRef, SELF_REF } from '../refs.js'
+import { lintStyle, scanMaterials, lintCoverage } from '../lint.js'
 
 const VALID_MODES = ['fill', 'append', 'fill+append']
 
@@ -60,12 +62,10 @@ T3 用户给了要求、想落成文件 → 先让用户建文件（本工具不
 · 记忆\\ 下的材料文件
 · 纯聊天、没有落成文件的意图
 
-【调用前】补注释前先调 find_sources —— 拿候选与出处，避免重复定义。
-出处优先写「记忆\\文件:行」；找不到外部依据的词，在 basis 里写清依据来自本文哪一节。
-basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，自指用「本文…」—— 报告会据此统计。
-【调用后】把返回原样贴给用户，尤其这三类别吞掉：未识别行 / 被拒 / 仍是空的（待补）。
+【引用】只在引用独立成文的文件时写「见 文件名」（可带 :行）。自己提炼、推演、指向本文的，不写引用。
+引用必须能解析：文件不存在、行号越界 → 该条被拒。指向本文的引用会被提示删掉。
+【调用后】把返回原样贴给用户，尤其这四类别吞掉：未识别行 / 被拒 / 仍是空的（待补）/ 引用无法解析。
 同一条内容不要重复调用 —— 第二次只会报"无变化"。
-写盘前请确认：每条 comments 都带 basis（schema 会强制）。
 
 补全规则：
 - 只写有依据的：每条注释必须能指出依据（要求原文的哪句话，或哪份材料的哪一行）。不确定的宁可不写 —— 留空或干脆不写，比写错好。
@@ -94,17 +94,13 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
                     properties: {
                         word:    { type: 'string', required: true, description: '词。2-12 字，不含冒号' },
                         content: { type: 'string', description: '内容，可为空字符串（= 待补）' },
-                        basis:   { type: 'string', required: true, description: '凭什么这么写。必填' }
+                        basis:   { type: 'string', description: '可选。引用哪个文件作依据，写「文件:行」；自指或自己提炼的不填' }
                     }
                 }
             },
             mode: {
                 type: 'string',
                 description: "'fill' | 'append' | 'fill+append'（默认 fill+append）"
-            },
-            recordBasis: {
-                type: 'boolean',
-                description: '默认 true：把 basis 写进「出处：」区'
             }
         },
 
@@ -115,7 +111,7 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
 
         async execute(args, exec) {
             try {
-                const { file, comments = [], mode = 'fill+append', recordBasis = true } = args ?? {}
+                const { file, comments = [], mode = 'fill+append' } = args ?? {}
 
                 // ── 0. mode 校验：非法值直接失败，不碰文件 ──
                 if (!VALID_MODES.includes(mode)) {
@@ -190,14 +186,15 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
                 const skipExist = []   // 已有内容且不同（真跳过）
                 const blocked = []     // 文件无注释区，想补也补不进去
                 const rejected = []    // { word, reason }
-                const basisRecords = [] // { word, basis } —— 本次真正写出的依据（供"依据来源统计"）
+                const refOk = []       // 可解析的引用（供"引用"统计）
+                const refSelf = []     // 指向本文的引用（提示删除）
+                const refWarn = []     // 顺带提到的文件名解析失败（只警告，不拒）
                 const seen = new Set()
 
                 // 行级编辑操作：{ at, kind, lines, seq }，应用时按 (at↓, seq↓) 排序
                 const ops = []
                 let seq = 0
                 const commentAppends = [] // 注释区末尾追加的行（合并为一个 insert）
-                const sourceAppends = []  // 出处区末尾追加的行（无出处区时连带新建区标记）
 
                 for (const comment of comments) {
                     const word    = String(comment?.word ?? '').trim()
@@ -205,15 +202,35 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
                     const basis   = String(comment?.basis ?? '').trim()
 
                     // 4a. 校验（优先于查重）
-                    if (!basis) {
-                        rejected.push({ word: word || '(空)', reason: '没给依据' })
-                        continue
-                    }
                     if (!word || !RE_WORD.test(word)) {
                         rejected.push({
                             word: word || '(空)',
                             reason: '词不合规（2-12 个中文/字母/数字/下划线，无标点空格）'
                         })
+                        continue
+                    }
+
+                    // 4a2. 引用校验：只认外部文件；指向本文的不算引用；
+                    //      显式引用（见 文件:行 / basis）解析失败即拒，顺带提到只警告
+                    const refs = extractRefs(content)
+                    if (basis) refs.unshift({ name: basis, line: undefined, explicit: true })
+                    const bad = []
+                    for (const ref of refs) {
+                        const got = await checkRef(basePath, ref.name, ref.line)
+                        if (got.kind === 'missing') {
+                            if (ref.explicit) bad.push(`${ref.name}（文件不存在）`)
+                            else refWarn.push(`${ref.name}（文件不存在）`)
+                        } else if (got.kind === 'range') {
+                            if (ref.explicit) bad.push(`${ref.name}:${ref.line}（超出文件 ${got.count} 行）`)
+                            else refWarn.push(`${ref.name}:${ref.line}（超出文件 ${got.count} 行）`)
+                        } else if (got.kind === 'self') {
+                            refSelf.push(ref.name)
+                        } else {
+                            refOk.push(ref.name)
+                        }
+                    }
+                    if (bad.length > 0) {
+                        rejected.push({ word, reason: `引用无法解析：${bad.join('、')}` })
                         continue
                     }
 
@@ -256,17 +273,6 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
                                 })
                             }
                             written.push(word)
-                            // 出处随内容更新（依据相同则跳过 = 幂等）
-                            if (recordBasis) {
-                                if (existing.basisLine >= 0) {
-                                    if (existing.basis !== basis) {
-                                        ops.push({ at: existing.basisLine, kind: 'replace', lines: [`${word} ← ${basis}`], seq: seq++ })
-                                    }
-                                } else {
-                                    sourceAppends.push(`${word} ← ${basis}`)
-                                }
-                                basisRecords.push({ word, basis })
-                            }
                         } else {
                             skipModeFill.push(word)
                         }
@@ -286,10 +292,6 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
                         for (const r of rest) commentAppends.push(`  ${r}`)
                         if (hasText) {
                             written.push(word)
-                            if (recordBasis) {
-                                sourceAppends.push(`${word} ← ${basis}`)
-                                basisRecords.push({ word, basis })
-                            }
                         } else {
                             pendingNew.push(word)
                         }
@@ -312,16 +314,7 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
                     const at = lastNonBlank(parsed._lines, parsed.commentRange) + 1
                     ops.push({ at, kind: 'insert', lines: commentAppends, seq: seq++ })
                 }
-                if (sourceAppends.length > 0) {
-                    if (parsed.sourceRange) {
-                        const at = lastNonBlank(parsed._lines, parsed.sourceRange) + 1
-                        ops.push({ at, kind: 'insert', lines: sourceAppends, seq: seq++ })
-                    } else {
-                        // 新建出处区：注释区最后非空行后，先空行再「出处：」
-                        const at = lastNonBlank(parsed._lines, parsed.commentRange) + 1
-                        ops.push({ at, kind: 'insert', lines: ['', '出处：', ...sourceAppends], seq: seq++ })
-                    }
-                }
+
 
                 // ── 7. 从后往前应用（大索引先动，小索引不失效；同 at 时 seq 大的先动）──
                 const nextLines = [...parsed._lines]
@@ -393,15 +386,14 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
                 if (skipDup.length)     out.push(`跳过 ${skipDup.length} 条（同一批里重复提交）：${skipDup.join(' / ')}`)
                 appendRejected(out, rejected)
 
-                if (basisRecords.length) {
-                    let toMaterial = 0, selfRef = 0, unverifiable = 0
-                    for (const r of basisRecords) {
-                        const kind = classifyBasis(r.basis)
-                        if (kind === '指向材料') toMaterial++
-                        else if (kind === '仅自指') selfRef++
-                        else unverifiable++
-                    }
-                    out.push(`依据来源：指向材料 ${toMaterial} 条 / 仅自指 ${selfRef} 条 / 无法核对 ${unverifiable} 条`)
+                if (refOk.length > 0 || refSelf.length > 0 || refWarn.length > 0) {
+                    const parts = []
+                    if (refOk.length > 0) parts.push(`可解析 ${refOk.length} 条（${refOk.join('、')}）`)
+                    if (refSelf.length > 0) parts.push(`指向本文 ${refSelf.length} 条（可删）：${refSelf.join('、')}`)
+                    if (refWarn.length > 0) parts.push(`顺带提到未解析 ${refWarn.length} 条（不拒）：${refWarn.join('、')}`)
+                    out.push(`引用：${parts.join(' / ')}`)
+                } else {
+                    out.push('引用：无')
                 }
 
                 if (unparsedLines.length) {
@@ -429,6 +421,19 @@ basis 请写成可分类的形态：指向材料用「记忆\\文件:行」，�
                 out.push(samePreamble
                     ? '未改动：标题、正文'
                     : '❗ 注意：标题或正文发生了变化（这是 bug，请报告）')
+                const lintWarnings = [
+                    ...lintStyle(parsed),
+                    ...lintCoverage(
+                        parsed,
+                        await scanMaterials(basePath, { depth: 2 }),
+                        [...refOk, ...refSelf],
+                        filePath
+                    ),
+                ]
+                if (lintWarnings.length > 0) {
+                    out.push(`检查：${lintWarnings.length} 条`)
+                    for (const w of lintWarnings) out.push('  · ' + w)
+                }
                 out.push(`文件：${filePath}`)
                 out.push(`sha256：${hash}`)
 
@@ -447,16 +452,4 @@ function appendRejected(out, rejected) {
     out.push(`被拒 ${rejected.length} 条：${items}`)
 }
 
-/**
- * 给一条 basis 分类（供"依据来源统计"）：
- *   指向材料 = 写了「记忆\x.txt:行」这类可回查的位置
- *   仅自指   = 指向本文 / 要求原文
- *   无法核对 = 两者都不是（读不出出处在哪）
- */
-function classifyBasis(basis) {
-    const s = String(basis ?? '').trim()
-    if (!s) return '无法核对'
-    if (/[:：]\s*\d+\s*$/.test(s) || /记忆[\\/]/.test(s) || /\.(txt|md)[:：]\d/.test(s)) return '指向材料'
-    if (/本文|本篇|本节|本文件|正文|要求原文|同上/.test(s)) return '仅自指'
-    return '无法核对'
-}
+

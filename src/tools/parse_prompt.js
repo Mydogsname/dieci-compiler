@@ -3,24 +3,13 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parsePrompt } from '../parse_prompt.js'
+import { extractRefs, SELF_REF } from '../refs.js'
+import { lintStyle, scanMaterials, lintCoverage } from '../lint.js'
 
 /** 取一行不超过 20 字的预览（含标点空格按原样截前 20 个字符，加省略号） */
 function preview(line, max = 20) {
     const s = String(line ?? '')
     return s.length > max ? s.slice(0, max) + '…' : s
-}
-
-/** 段内行号区间（基于原始行号，1 起），全空段返回 null */
-function lineSpan(lines, range, lines0) {
-    if (!range) return null
-    let first = range[0] + 1   // 1 起
-    let last = range[1]        // slice 上界 = 最后非空行 + 1（或段末）
-    // 找段内最后一个非空行（1 起行号）
-    let lastNonBlank = -1
-    for (let i = range[1] - 1; i >= range[0]; i--) {
-        if (lines0[i].trim() !== '') { lastNonBlank = i + 1; break }
-    }
-    return { first, last: lastNonBlank > 0 ? lastNonBlank : first - 1 }
 }
 
 // ─── 工具工厂 ───
@@ -140,18 +129,27 @@ export function makeParsePromptTool({ ctx, fallbackWorkspace } = {}) {
                 out.push(parsed.pending.length
                     ? `  · 待补（空内容）：${parsed.pending.join(' / ')}`
                     : '  · 待补：无')
-                out.push(parsed.noBasis.length
-                    ? `  · 缺依据：${parsed.noBasis.join(' / ')}`
-                    : '  · 缺依据：无')
+                // 引用（写在注释内容里）
+                const refs = parsed.comments.flatMap(c => extractRefs(c.content))
+                out.push(refs.length ? `引用：${refs.length} 条（写在注释内容里）` : '引用：无')
+                const selfRefs = refs.filter(r => SELF_REF.test(r.name)).map(r => r.name)
+                if (selfRefs.length) out.push(`  · 指向本文的引用：${selfRefs.join(' / ')}（正文就在同一文件里，可删）`)
 
-                // 出处区
-                if (parsed.sourceRange) {
-                    const span = lineSpan(parsed.sourceLines, parsed.sourceRange, parsed._lines)
-                    // 实际出处条目数（非空且能匹配 ← 的）
-                    const count = parsed.comments.filter(c => c.basis).length
-                    out.push(`出处：${count} 条（第 ${span.first}–${span.last} 行）`)
+                // 风格检查（只警告）
+                const lintWarnings = [
+                    ...lintStyle(parsed),
+                    ...lintCoverage(
+                        parsed,
+                        await scanMaterials(basePath, { depth: 2 }),
+                        refs.map(r => r.name),
+                        filePath
+                    ),
+                ]
+                if (lintWarnings.length > 0) {
+                    out.push(`检查：${lintWarnings.length} 条`)
+                    for (const w of lintWarnings) out.push('  · ' + w)
                 } else {
-                    out.push('出处：无')
+                    out.push('检查：无')
                 }
 
                 // 未识别行
