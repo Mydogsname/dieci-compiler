@@ -1,8 +1,7 @@
-import { makeMemorySaveTool, registerTurnMemoryCheck } from './tools/memory_save.js'
 import { makeAnnotateTool } from './tools/annotate.js'
 import { makeParsePromptTool } from './tools/parse_prompt.js'
 import { makeFindSourcesTool } from './tools/find_sources.js'
-import { registerSaveCommand, registerDieciCommand } from './save_command.js'
+import { registerDieciCommand } from './save_command.js'
 import { DIECI_GUIDE } from './guide.js'
 
 export const name = 'dieci-compiler'
@@ -12,16 +11,6 @@ export const name = 'dieci-compiler'
 export const inject = ['tools', 'sessions', 'workspaceRegistry', 'commands']
 
 export function apply(ctx, config = {}) {
-  console.log('>>> [叠词编译器] 已加载')
-
-  const subdir = config.memorySubdir ?? '记忆'
-
-  ctx.tools.register(makeMemorySaveTool({
-    ctx,
-    subdir,
-    fallbackWorkspace: config.workspace
-  }))
-
   // 补全注释：往已有叠词文件的注释区填/追加条目
   ctx.tools.register(makeAnnotateTool({
     ctx,
@@ -39,12 +28,6 @@ export function apply(ctx, config = {}) {
     ctx,
     fallbackWorkspace: config.workspace
   }))
-
-  // 漏存防线：turn 结束时检查本轮有没有漏存记忆（写 记忆/_待补.md）
-  registerTurnMemoryCheck(ctx, { subdir })
-
-  // 用户主动保存：/save（最近一条回答）
-  registerSaveCommand(ctx, { subdir })
 
   // /dieci <主题>：建骨架 + 把成文任务派给模型
   registerDieciCommand(ctx, { subdir })

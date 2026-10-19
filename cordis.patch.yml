@@ -1,5 +1,3 @@
 - insert:
     - id: dieci-compiler
       name: dieci-compiler
-      config:
-        memorySubdir: '记忆'

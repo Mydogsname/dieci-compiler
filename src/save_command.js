@@ -1,31 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { toSafeName, oneLine, normalizeBody, uniquePath } from './tools/memory_save.js'
-
-/**
- * 一条用户主动保存的斜杠命令。
- *
- *   /save                        → 保存最近一条助手回答，标题自动取首行
- *   /save 标题                    → 以「标题」命名保存最近一条助手回答
- *   /save 长正文…（>50 字或含换行）  → 直接保存这段正文
- *
- * recordInput: false —— 正文可能几千字，记忆文件本身就是唯一数据源，
- * 不再把 rawInput 抄进会话日志。不影响 handler 收到 rawInput。
- *
- * 注意：invocation 上只有 { commandId, agent, rawInput, signal }，
- * 没有 session —— 会话必须从 invocation.agent.session 取。
- */
-
-export function registerSaveCommand(ctx, { subdir = '记忆' } = {}) {
-    ctx.commands?.register({
-        name: 'save',
-        description: '把最近一条回答保存为记忆',
-        input: { hint: '[标题 或 要保存的正文]' },
-        recordInput: false,
-        handler: (invocation) => runSave(invocation, { ctx, subdir })
-    })
-}
 
 /**
  * /dieci <主题> —— 建叠词文件骨架，并把「围绕主题成文」的活派给模型。
@@ -34,14 +9,16 @@ export function registerSaveCommand(ctx, { subdir = '记忆' } = {}) {
  * 扫描与判断全交给模型自己的 find_sources / annotate —— 判据只留一份。
  *
  * recordInput: false —— 主题会写进骨架文件名，日志里不再抄一份。
+ * 注意：invocation 上只有 { commandId, agent, rawInput, signal }，
+ * 没有 session —— 会话必须从 invocation.agent.session 取。
  */
-export function registerDieciCommand(ctx, { subdir = '记忆', ext = '.txt', commandName = 'dieci' } = {}) {
+export function registerDieciCommand(ctx, { ext = '.txt', commandName = 'dieci' } = {}) {
     ctx.commands?.register({
         name: commandName,
-        description: '围绕一个主题建叠词文件，并让 AI 成文与补注释',
+        description: '输入一个主题（限30字）建叠词文件，并让 AI 成文与补注释',
         input: { hint: '<主题>' },
         recordInput: false,
-        handler: (invocation) => runDieci(invocation, { ctx, subdir, ext })
+        handler: (invocation) => runDieci(invocation, { ctx, ext })
     })
 }
 
@@ -50,12 +27,12 @@ function agentSession(invocation) {
     try {
         return invocation?.agent?.session ?? null
     } catch (err) {
-        console.warn('[save] 读取 agent.session 失败：', err?.message ?? err)
+        console.warn('[dieci] 读取 agent.session 失败：', err?.message ?? err)
         return null
     }
 }
 
-/** 工作区根：cwd → workspaceRegistry → cwd 兜底（与 memory_save 同一条链） */
+/** 工作区根：cwd → workspaceRegistry → cwd 兜底 */
 async function resolveBasePath(ctx, session) {
     const cwd = session?.header?.cwd ?? null
     if (!cwd) return null
@@ -66,111 +43,10 @@ async function resolveBasePath(ctx, session) {
             const ws = await registry.resolveByPath(cwd)
             if (ws?.path) return ws.path
         } catch (err) {
-            console.warn('[save] resolveByPath 失败：', err?.message ?? err)
+            console.warn('[dieci] resolveByPath 失败：', err?.message ?? err)
         }
     }
     return cwd
-}
-
-/** 把一条 AssistantMessage 的文本块拼成纯文本 */
-function textOf(message) {
-    const content = message?.content
-    if (typeof content === 'string') return content.trim()
-    if (!Array.isArray(content)) return ''
-    let out = ''
-    for (const block of content) {
-        if (typeof block === 'string') out += block
-        else if (typeof block?.text === 'string') out += block.text
-    }
-    return out.trim()
-}
-
-/**
- * 会话事件流里最近一条有文本的 assistant/message。
- * 事件结构：{ type: 'assistant/message', data: { turn, step, message } }，
- * message.id 就是界面 slot 传来的 messageId。
- */
-function lastAssistantText(session) {
-    const events = Array.isArray(session?.events) ? session.events : []
-    for (let i = events.length - 1; i >= 0; i--) {
-        const event = events[i]
-        if (event?.type !== 'assistant/message') continue
-        const text = textOf(event.data?.message)
-        if (text.length > 0) return text
-    }
-    return ''
-}
-
-/** 从正文首行造标题：去 markdown 记号，截 30 字 */
-function autoTitle(text) {
-    const lines = String(text ?? '').split('\n')
-    let first = ''
-    for (const line of lines) {
-        const trimmed = line.trim()
-        if (trimmed.length > 0) {
-            first = trimmed
-            break
-        }
-    }
-    const clean = first.replace(/^#+\s*/, '').replace(/[#*_>]/g, '').trim()
-    if (clean.length === 0) return '未命名'
-    return clean.length > 30 ? clean.slice(0, 30) : clean
-}
-
-/** 共用写入：模型工具 / 两条命令 / 界面按钮 命名与格式完全一致 */
-async function writeMemory({ basePath, subdir, title, content, source }) {
-    const baseDir = path.join(basePath, subdir)
-    await fs.mkdir(baseDir, { recursive: true })
-
-    const safe = toSafeName(title)
-    const now = new Date()
-    const iso = now.toISOString()
-    const stamp = iso.slice(0, 10).replace(/-/g, '') + '-' + iso.slice(11, 19).replace(/:/g, '')
-    const filePath = await uniquePath(baseDir, safe + '_' + stamp, '.txt')
-
-    let body = '# ' + oneLine(title) + '\n\n'
-    body += '时间：' + iso + '\n'
-    body += '来源：' + source + '\n\n'
-    body += normalizeBody(content) + '\n'
-
-    const tmpPath = filePath + '.tmp'
-    await fs.writeFile(tmpPath, body, 'utf-8')
-    await fs.rename(tmpPath, filePath)
-
-    return '已保存记忆：' + path.relative(basePath, filePath)
-}
-
-async function runSave(invocation, { ctx, subdir }) {
-    try {
-        const rawInput = String(invocation?.rawInput ?? '').trim()
-        const session = agentSession(invocation)
-        const basePath = await resolveBasePath(ctx, session)
-        if (!basePath || !path.isAbsolute(basePath)) {
-            return { kind: 'error', text: '保存失败：无法解析工作区路径' }
-        }
-
-        let title = ''
-        let content = ''
-        if (rawInput.includes('\n') || rawInput.length > 50) {
-            content = rawInput
-            title = autoTitle(rawInput)
-        } else if (rawInput.length > 0) {
-            title = rawInput
-            content = lastAssistantText(session)
-        } else {
-            content = lastAssistantText(session)
-            title = autoTitle(content)
-        }
-
-        if (content.length === 0) {
-            return { kind: 'error', text: '保存失败：没有可保存的内容（最近没有助手回答，也没给正文）' }
-        }
-
-        const text = await writeMemory({ basePath, subdir, title, content, source: '/save 命令' })
-        return { kind: 'success', text }
-    } catch (err) {
-        return { kind: 'error', text: '保存失败：' + (err?.message ?? err) }
-    }
 }
 
 /** 从用户输入取主题：取第一个非空行，去掉 markdown 记号，截 30 字 */
@@ -217,11 +93,18 @@ async function runDieci(invocation, { ctx, ext }) {
             `主题：${theme}`,
             `文件：${rel}（只有标题行和「注释：」，正文空）`,
             '',
-            '正文只写这个主题本身，连续成段，不分节：不写「一、」，不加小标题，不用编号列表。',
+            '正文只写这个主题本身，连续成段：不写「一、」，不加小标题，不用编号列表。',
             '不写"本文将…"这类元话；不许出现"材料""提示""第X节"这类对来源的指称。',
             '正文里不要出现「词：内容」式的短行。',
             '',
-            '为什么这样写、边界在哪、怎么算完成 —— 全部放进注释。',
+            '注释区写两类东西：和别处的关系，以及主题内的兑现条件。四类，都算注释：',
+            '① 参数：正文里某个词的取值，来自另一份文件的产出或某一处事实 —— 写清是谁给的、给的是哪一处。',
+            '② 执行结果：这份正文的产出，给哪一份文件用、当它的什么用。',
+            '③ 其它关系：前两类之外的明确关系 —— 谁负责什么、谁不管什么、谁在谁之前、谁替代谁。',
+            '   只写与本主题直接相关的：关系必须能落回正文里某个词，写不出对应哪个词的，不写。',
+            '④ 主题内：这个词在本文里达到什么算做到、怎么验证。与别的文件无关。',
+            '前三类没有就不写；第四类按正文实际情况写，没有也不凑。',
+            '注释的词必须是正文里真的出现的词，不是「参数」「执行结果」「其它关系」这类关系名。',
             '只在引用独立成文的文件时写「见 文件名」（可带 :行）；自己提炼、推演、指向本文的，不写引用。',
             '注释词不用元词（推演/说明/备注/注）。',
             '',
@@ -243,5 +126,47 @@ async function runDieci(invocation, { ctx, ext }) {
         return { kind: 'success', text: `已建 ${rel}，并已把成文任务派给模型` }
     } catch (err) {
         return { kind: 'error', text: '建文件失败：' + (err?.message ?? err) }
+    }
+}
+
+// ─── 文件名小工具 ───
+
+const WIN_RESERVED = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i
+
+/** 主题 → 安全文件名：去指令词、替换非法字符、限长 100 字节 */
+function toSafeName(title) {
+    let name = String(title ?? '')
+        .replace(/^(记一下|保存|存起来|记住|记录)[：:\s]*/, '')
+        .replace(/[\\/:*?"<>|\r\n\t]/g, '_')
+        .replace(/\s+/g, '_')
+        .replace(/^\.+/, '')
+        .replace(/[. ]+$/, '')
+        .trim()
+    if (!name) name = '未命名'
+    if (WIN_RESERVED.test(name)) name = `_${name}`
+    if (Buffer.byteLength(name, 'utf-8') > 100) {
+        name = Buffer.from(name, 'utf-8').subarray(0, 100).toString('utf-8')
+        name = name.replace(/\uFFFD$/, '')
+    }
+    return name
+}
+
+/** 多行压成一行（标题用） */
+function oneLine(s) {
+    return String(s ?? '').replace(/\s*\r?\n\s*/g, ' ').trim()
+}
+
+/** 在 baseDir 下找一个不冲突的文件路径：base.txt → base-2.txt → base-3.txt ... */
+async function uniquePath(baseDir, base, ext) {
+    let p = path.join(baseDir, `${base}${ext}`)
+    let i = 2
+    while (true) {
+        try {
+            await fs.access(p)
+            p = path.join(baseDir, `${base}-${i}${ext}`)
+            i++
+        } catch {
+            return p
+        }
     }
 }
