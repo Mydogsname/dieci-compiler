@@ -3,8 +3,6 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parsePrompt } from '../parse_prompt.js'
-import { extractRefs, SELF_REF } from '../refs.js'
-import { lintStyle, scanMaterials, lintCoverage } from '../lint.js'
 
 /** 取一行不超过 20 字的预览（含标点空格按原样截前 20 个字符，加省略号） */
 function preview(line, max = 20) {
@@ -17,17 +15,11 @@ export function makeParsePromptTool({ ctx, fallbackWorkspace } = {}) {
     return defineTool({
         name: 'parse_prompt',
         description: `看一个叠词文件的注释状态。只读，绝不写盘。
-
 【什么时候调用】读出状态、不改文件，所以可以随时调用：
 1. 你因为任务需要打开了一个文件，看完顺手检查它的注释状态
-2. 用户问"这文件什么状态""还差什么""补到哪了"
-3. 准备调用 annotate 之前先自检 —— 拿到精确的缺口清单，避免重复补或漏补
-4. 用户说"看看注释全不全"
-
+2. 准备调用 annotate 之前先自检 —— 拿到精确的缺口清单，避免重复补或漏补
 【不要调用】
 · 用户只是想让你读内容、不需要注释状态
-· 记忆\\ 下的材料文件（材料层不含注释）
-
 【这个工具不写盘】看完要落笔，用 annotate。`,
 
         parameters: {
@@ -129,28 +121,6 @@ export function makeParsePromptTool({ ctx, fallbackWorkspace } = {}) {
                 out.push(parsed.pending.length
                     ? `  · 待补（空内容）：${parsed.pending.join(' / ')}`
                     : '  · 待补：无')
-                // 引用（写在注释内容里）
-                const refs = parsed.comments.flatMap(c => extractRefs(c.content))
-                out.push(refs.length ? `引用：${refs.length} 条（写在注释内容里）` : '引用：无')
-                const selfRefs = refs.filter(r => SELF_REF.test(r.name)).map(r => r.name)
-                if (selfRefs.length) out.push(`  · 指向本文的引用：${selfRefs.join(' / ')}（正文就在同一文件里，可删）`)
-
-                // 风格检查（只警告）
-                const lintWarnings = [
-                    ...lintStyle(parsed),
-                    ...lintCoverage(
-                        parsed,
-                        await scanMaterials(basePath, { depth: 2 }),
-                        refs.map(r => r.name),
-                        filePath
-                    ),
-                ]
-                if (lintWarnings.length > 0) {
-                    out.push(`检查：${lintWarnings.length} 条`)
-                    for (const w of lintWarnings) out.push('  · ' + w)
-                } else {
-                    out.push('检查：无')
-                }
 
                 // 未识别行
                 if (parsed.unparsed.length > 0) {

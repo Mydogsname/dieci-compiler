@@ -221,7 +221,7 @@ export function makeFindSourcesTool({ ctx, fallbackWorkspace } = {}) {
         description: `找来源与已有定义。只读，不给相似度、不写盘、不建关系 —— 写注释用 annotate。
 
 【什么时候调用】
-1. 补注释前（拿候选与出处，避免重复定义）—— 调完再调 annotate，出处优先写「记忆\\文件:行」
+1. 补注释前（拿候选与出处，避免重复定义）—— 调完再调 annotate
 2. 用户问"这个说法有依据吗""别处定义过吗""这个词在哪出现过"
 3. 你想用一个词但不确定它是否已被别的文件定义过
 

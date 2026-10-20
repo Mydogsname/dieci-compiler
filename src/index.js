@@ -1,6 +1,7 @@
 import { makeAnnotateTool } from './tools/annotate.js'
 import { makeParsePromptTool } from './tools/parse_prompt.js'
 import { makeFindSourcesTool } from './tools/find_sources.js'
+import { makeDecomposeTool } from './tools/decompose.js'
 import { registerDieciCommand } from './save_command.js'
 import { DIECI_GUIDE } from './guide.js'
 
@@ -29,8 +30,14 @@ export function apply(ctx, config = {}) {
     fallbackWorkspace: config.workspace
   }))
 
+  // 拆解：源正文 → 词表候选（词 | 语法角色 | 三测 | 各源文件原句）（只读）
+  ctx.tools.register(makeDecomposeTool({
+    ctx,
+    fallbackWorkspace: config.workspace
+  }))
+
   // /dieci <主题>：建骨架 + 把成文任务派给模型
-  registerDieciCommand(ctx, { subdir })
+  registerDieciCommand(ctx)
 
   // 系统提示段落：让每个会话默认明白叠词工作流的思路
   // 写法 A（优雅降级）：宿主没有 systemPrompt 服务时，其余工具照常工作

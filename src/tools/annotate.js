@@ -3,8 +3,6 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parsePrompt, serialize, RE_WORD } from '../parse_prompt.js'
-import { extractRefs, checkRef, SELF_REF } from '../refs.js'
-import { lintStyle, scanMaterials, lintCoverage } from '../lint.js'
 
 const VALID_MODES = ['fill', 'append', 'fill+append']
 
@@ -59,23 +57,18 @@ T3 用户给了要求、想落成文件 → 先让用户建文件（本工具不
 · 文件没有独占一行的「注释：」 → 先告诉用户加这一行，不要硬调
 · 文件不存在 → 告诉用户先建
 · 注释区已齐、你又写不出新关系或新兑现条件 → 宁可不调
-· 记忆\\ 下的材料文件
 · 纯聊天、没有落成文件的意图
 
 【引用】只在引用独立成文的文件时写「见 文件名」（可带 :行）。自己提炼、推演、指向本文的，不写引用。
-引用必须能解析：文件不存在、行号越界 → 该条被拒。指向本文的引用会被提示删掉。
-【调用后】把返回原样贴给用户，尤其这四类别吞掉：未识别行 / 被拒 / 仍是空的（待补）/ 引用无法解析。
+【调用后】把返回原样贴给用户，尤其这三类别吞掉：未识别行 / 被拒 / 仍是空的（待补）。
 同一条内容不要重复调用 —— 第二次只会报"无变化"。
 
 补全规则：
-- 注释只写两类东西：与别处的关系，以及主题内的兑现条件。四类，都算注释：
-  ① 参数：正文里某个词的取值，来自另一份文件的产出或某一处事实 —— 写清是谁给的、给的是哪一处。
-  ② 执行结果：这份正文的产出，给哪一份文件用、当它的什么用。
-  ③ 其它关系：谁负责什么、谁不管什么、谁在谁之前、谁替代谁。只写与本主题直接相关的：关系必须能落回正文里某个词，写不出对应哪个词的，不写。
-  ④ 主题内：这个词在本文里达到什么算做到、怎么验证。与别的文件无关。
-- 注释的词必须是正文里真的出现的词，不是「参数」「执行结果」「其它关系」这类关系名。
-- 前三类没有就不写，一条都不要凑；第四类按正文实际情况写，没有也不凑。
-- 首次最多补 5 条：写满会让人审不动。不确定的宁可不写 —— 比写错好。
+- 注释是匹配：正文里出现的词 + 它在别处的出处，写成「词：见 文件:行」；同一词多处出处写进同一条，用「；见」分隔。
+- 只写精确匹配；近似、疑似不写。匹配不到出处就不写，宁缺勿凑。
+- 不写关系整理（谁给的、谁负责、谁替代谁、产出给谁用）、不抄来源内容、不写处理指示（按原事实/不夸张/只转写/不另立构图）、不写验证。
+- 词必须是正文里真的出现的词，不是「参数」「执行结果」「其它关系」这类关系名。
+- 不要废话，注释语义要唯一。
 - 不要改动标题和正文 —— 那是用户的原话。
 - 不要重排或删除已有条目 —— 那是用户的或上一轮的成果。`,
 
@@ -191,9 +184,6 @@ T3 用户给了要求、想落成文件 → 先让用户建文件（本工具不
                 const skipExist = []   // 已有内容且不同（真跳过）
                 const blocked = []     // 文件无注释区，想补也补不进去
                 const rejected = []    // { word, reason }
-                const refOk = []       // 可解析的引用（供"引用"统计）
-                const refSelf = []     // 指向本文的引用（提示删除）
-                const refWarn = []     // 顺带提到的文件名解析失败（只警告，不拒）
                 const seen = new Set()
 
                 // 行级编辑操作：{ at, kind, lines, seq }，应用时按 (at↓, seq↓) 排序
@@ -204,7 +194,6 @@ T3 用户给了要求、想落成文件 → 先让用户建文件（本工具不
                 for (const comment of comments) {
                     const word    = String(comment?.word ?? '').trim()
                     const content = String(comment?.content ?? '')
-                    const basis   = String(comment?.basis ?? '').trim()
 
                     // 4a. 校验（优先于查重）
                     if (!word || !RE_WORD.test(word)) {
@@ -212,30 +201,6 @@ T3 用户给了要求、想落成文件 → 先让用户建文件（本工具不
                             word: word || '(空)',
                             reason: '词不合规（2-12 个中文/字母/数字/下划线，无标点空格）'
                         })
-                        continue
-                    }
-
-                    // 4a2. 引用校验：只认外部文件；指向本文的不算引用；
-                    //      显式引用（见 文件:行 / basis）解析失败即拒，顺带提到只警告
-                    const refs = extractRefs(content)
-                    if (basis) refs.unshift({ name: basis, line: undefined, explicit: true })
-                    const bad = []
-                    for (const ref of refs) {
-                        const got = await checkRef(basePath, ref.name, ref.line)
-                        if (got.kind === 'missing') {
-                            if (ref.explicit) bad.push(`${ref.name}（文件不存在）`)
-                            else refWarn.push(`${ref.name}（文件不存在）`)
-                        } else if (got.kind === 'range') {
-                            if (ref.explicit) bad.push(`${ref.name}:${ref.line}（超出文件 ${got.count} 行）`)
-                            else refWarn.push(`${ref.name}:${ref.line}（超出文件 ${got.count} 行）`)
-                        } else if (got.kind === 'self') {
-                            refSelf.push(ref.name)
-                        } else {
-                            refOk.push(ref.name)
-                        }
-                    }
-                    if (bad.length > 0) {
-                        rejected.push({ word, reason: `引用无法解析：${bad.join('、')}` })
                         continue
                     }
 
@@ -379,16 +344,6 @@ T3 用户给了要求、想落成文件 → 先让用户建文件（本工具不
                 if (skipDup.length)     out.push(`跳过 ${skipDup.length} 条（同一批里重复提交）：${skipDup.join(' / ')}`)
                 appendRejected(out, rejected)
 
-                if (refOk.length > 0 || refSelf.length > 0 || refWarn.length > 0) {
-                    const parts = []
-                    if (refOk.length > 0) parts.push(`可解析 ${refOk.length} 条（${refOk.join('、')}）`)
-                    if (refSelf.length > 0) parts.push(`指向本文 ${refSelf.length} 条（可删）：${refSelf.join('、')}`)
-                    if (refWarn.length > 0) parts.push(`顺带提到未解析 ${refWarn.length} 条（不拒）：${refWarn.join('、')}`)
-                    out.push(`引用：${parts.join(' / ')}`)
-                } else {
-                    out.push('引用：无')
-                }
-
                 if (unparsedLines.length) {
                     // 用 20 字预览（与 parse_prompt 工具同款）
                     const byLine = new Map(parsed.unparsed.map(u => [u.line, u]))
@@ -414,19 +369,6 @@ T3 用户给了要求、想落成文件 → 先让用户建文件（本工具不
                 out.push(samePreamble
                     ? '未改动：标题、正文'
                     : '❗ 注意：标题或正文发生了变化（这是 bug，请报告）')
-                const lintWarnings = [
-                    ...lintStyle(parsed),
-                    ...lintCoverage(
-                        parsed,
-                        await scanMaterials(basePath, { depth: 2 }),
-                        [...refOk, ...refSelf],
-                        filePath
-                    ),
-                ]
-                if (lintWarnings.length > 0) {
-                    out.push(`检查：${lintWarnings.length} 条`)
-                    for (const w of lintWarnings) out.push('  · ' + w)
-                }
                 out.push(`文件：${filePath}`)
                 out.push(`sha256：${hash}`)
 
