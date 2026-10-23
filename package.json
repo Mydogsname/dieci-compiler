@@ -1,6 +1,6 @@
 {
   "name": "dieci-compiler",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "叠词：总结本地文件生成注释格式的提示词",
   "type": "module",
   "main": "src/index.js",

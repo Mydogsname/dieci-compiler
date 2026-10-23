@@ -1,257 +1,218 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { parsePrompt } from '../parse_prompt.js'
+import { createUserMessage, BlockAssembler, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { checkNotes, parseSemantic, renderSemantic, semanticPathFor } from '../core/text.js'
 
-// 不读的目录名（. 或 _ 前缀的已在 shouldSkipName 处理）
-const SKIP_DIRS = new Set(['node_modules', 'packages', 'vendor', 'apps', 'boot', 'core', '.git', '.svn'])
+const SYSTEM = `你是语义划分器。把正文按语义分组，只输出列表本身。
 
-/** 跳过自己吃自己：关系文件与已生成的提示词产物 */
-const SKIP_FILE = /^(注释关系-.*|.*提示词.*)\.(md|txt)$/i
+格式（逐条照做）：
+1. 一句一行：正文在 。！？； 处断句，一句原样占一行。
+2. 次序不变：行序 = 正文语序。不合句、不拆句、不重复、不遗漏。
+3. 组间空一行：同一方面的相邻句归一组，组与组之间只空一行（不是两行）。
+4. 一字不动：不改标点、不补字、不删字、不换词。
+5. 只输出列表：不写前言、不写解释、不编号、不加标题、不包代码块。`
 
-/** 原句摘录上限：整句 ≤60 字才摘，超长切不了只写文件名 */
-const SENTENCE_MAX = 60
+/** 重试次数上限（含首次） */
+const MAX_ATTEMPTS = 3
 
-/** 每个词最多列多少份源文件的出处 */
-const FILE_LIMIT = 30
+/** 输出上限（含推理），可按需调 */
+const DEFAULT_MAX_TOKENS = 8192
 
-/** 跳过隐藏/_前缀文件、.bak 文件 */
-function shouldSkipName(name) {
-    if (!name) return true
-    if (name.startsWith('.') || name.startsWith('_')) return true
-    if (/\.bak$/i.test(name)) return true
-    return false
+/**
+ * 这类「按格式照抄并分组」的任务不需要思考，而推理 token 与正文共享 maxTokens：
+ * 会话 reasoningEffort=high 时，模型可能把配额全花在思考上，正文一个字都不剩。
+ * 所以显式请求 off；provider 不支持 off 时自动退回默认档。
+ */
+const OFF_EFFORT = ReasoningEffortId('off')
+
+/** 该 provider 不认这个推理档位时的报错特征 */
+const EFFORT_REJECTED = /reasoning effort|推理档/i
+
+/**
+ * 把一次截断说清楚：上限多少、正文与推理各产出多少字、正文开头是什么。
+ * 「被截断」既可能是正文太长，也可能是推理吃光了配额——两者处置完全不同。
+ */
+function describeTruncation(blocks, maxTokensUsed) {
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
+    const reasoning = blocks.filter(b => b.type === 'reasoning').map(b => b.text).join('')
+    const head = text.slice(0, 300) || '（空）'
+    return [
+        `输出被 maxTokens 截断（上限 ${maxTokensUsed}）：正文 ${text.length} 字，推理 ${reasoning.length} 字。`,
+        reasoning.length > text.length
+            ? '推理占了大部分配额——应关闭思考（reasoningEffort=off）或提高 maxTokens。'
+            : '正文本身过长——请把源文件分段后再拆。',
+        `正文开头：${head}`,
+    ].join('\n')
 }
 
-function isTextFile(name) {
-    return /\.(txt|md)$/i.test(name)
-}
+/** 跑一次流，把「调用失败」与「正常结束」分开。 */
+async function streamOnce(ctx, exec, prompt, reasoningEffort) {
+    const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
+    if (!llm?.stream) return { ok: false, kind: 'no-llm', error: '宿主没有 llm 服务' }
 
-/** 按句切分：。！？； 以及换行 */
-function splitSentences(text) {
-    const s = String(text ?? '').replace(/\r\n?/g, '\n')
-    return s
-        .split(/(?<=[。！？；\n])/u)
-        .map(x => x.trim())
-        .filter(Boolean)
-}
-
-/** 词在文本里的精确命中（连续子串）；词面校验与 parse_prompt 同一口径 */
-function findExact(text, word) {
-    const hits = []
-    let idx = text.indexOf(word)
-    while (idx >= 0) {
-        hits.push(idx)
-        idx = text.indexOf(word, idx + word.length)
-        if (hits.length > 50) break
+    const route = exec?.agent?.options ?? {}
+    if (!route.provider || !route.model) {
+        return { ok: false, kind: 'no-route', error: '拿不到当前会话的 provider/model' }
     }
-    return hits
-}
 
-/** 摘一句含该词的原句；都超长则返回 null（调用方只写文件名） */
-function pickSentence(sentences, word) {
-    for (const s of sentences) {
-        if (s.includes(word) && s.length <= SENTENCE_MAX) return s
-    }
-    return null
-}
+    const maxTokensUsed = route.maxTokens ?? DEFAULT_MAX_TOKENS
+    const messages = [createUserMessage({
+        content: [{ type: 'text', text: prompt }],
+        source: { kind: 'plugin', plugin: 'dieci-compiler' },
+    })]
 
-/** 递归扫描目录（只读）→ [{ relPath, sentences }] */
-async function scanDir(dir, depth, base, out) {
-    if (depth < 0) return out
-
-    let entries
+    const assembler = new BlockAssembler()
     try {
-        entries = await fs.readdir(dir, { withFileTypes: true })
-    } catch {
-        return out
-    }
-
-    for (const ent of entries) {
-        if (shouldSkipName(ent.name)) continue
-        const full = path.join(dir, ent.name)
-
-        if (ent.isDirectory()) {
-            if (SKIP_DIRS.has(ent.name)) continue
-            await scanDir(full, depth - 1, base, out)
-        } else if (ent.isFile() && isTextFile(ent.name)) {
-            if (SKIP_FILE.test(ent.name)) continue
-            let text
-            try {
-                text = await fs.readFile(full, 'utf-8')
-            } catch {
-                continue
-            }
-            const parsed = parsePrompt(text)
-            // 有注释区只取正文；没有就是材料原文
-            const body = parsed.ok ? parsed.body : text
-            out.push({ relPath: path.relative(base, full).replace(/\\/g, '/'), sentences: splitSentences(body) })
+        for await (const chunk of llm.stream({
+            provider: route.provider,
+            model: route.model,
+            messages,
+            system: SYSTEM,
+            temperature: 0,
+            maxTokens: maxTokensUsed,
+            ...reasoningEffort === undefined ? {} : { reasoningEffort },
+            signal: exec?.signal,
+        })) {
+            assembler.push(chunk)
         }
+    } catch (err) {
+        return { ok: false, kind: 'threw', error: `模型调用出错：${err?.message ?? err}` }
     }
-    return out
+
+    if (assembler.finish?.kind === 'error') {
+        return { ok: false, kind: 'threw', error: `模型调用出错：${assembler.finish.failure?.message ?? '未知错误'}` }
+    }
+    if (assembler.finish?.kind === 'max-tokens') {
+        return { ok: false, kind: 'truncated', error: describeTruncation(assembler.blocks(), maxTokensUsed) }
+    }
+
+    const text = assembler.blocks()
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('')
+    return { ok: true, text }
+}
+
+/** 调模型：先请求 off（不思考），provider 不认这个档位就退回会话默认档。 */
+async function callModel(ctx, exec, prompt) {
+    const first = await streamOnce(ctx, exec, prompt, OFF_EFFORT)
+    if (first.ok) return first
+    if (first.kind !== 'threw' || !EFFORT_REJECTED.test(first.error)) return first
+
+    const second = await streamOnce(ctx, exec, prompt, undefined)
+    if (second.ok) return second
+    return {
+        ok: false,
+        error: `${second.error}\n（注：provider 不接受 reasoningEffort=off，已退回默认档；若仍被截断，说明思考占了预算。）`,
+    }
+}
+
+// ─── 把自检结果写成人话，交回模型重做 ───
+function feedbackFor(report) {
+    const parts = []
+    const line = items => items.slice(0, 6).map(l => `· ${l}`).join('\n')
+    if (report.bad.length) parts.push(`这些行与正文对不上（改字/编造/次序不对）：\n${line(report.bad)}`)
+    if (report.missing.length) parts.push(`这些源句没有出现：\n${line(report.missing)}`)
+    if (report.problems.length) parts.push(`结构问题：\n${line(report.problems)}`)
+    return parts.join('\n')
 }
 
 // ─── 工具工厂 ───
-export function makeDecomposeTool({ ctx, fallbackWorkspace } = {}) {
+export function makeDecomposeTool({ ctx } = {}) {
     return defineTool({
         name: 'decompose',
-        description: `拆解源正文，产出注释词候选表：词 | 语法角色 | 三测 | 各源文件原句。只读，不写盘。
-
-【什么时候调用】
-1. /dieci 派活后第一步
-2. 用户要求「拆解 / 提炼词语 / 生成注释关系文件」
-
-【拆解规则】
-- 按中文语法切：主谓宾、偏正、动宾的中心语；词面校验 = 正文中逐字连续出现、2-12 字、无标点空格。
-- 三测：指称测试（指称对象，不是语法零件）、引用测试（别的源文件会引用）、节点测试（删掉不缺节点）；过引用测试，或三测全过，才收。
-- 单字（如「一」）、数词量词、值词（如「一米六五」）不收；中心语收（旧书店、素木簪、帆布鞋）。
-- 原句：对每个词，在每份源文件里找包含它的句子（按 。！？； 切），整句 ≤60 字原样摘录；超长切不了只写文件名、不写原句。不删节、不归纳。
-
-【边界】本工具只做可核对的事：找原句、数命中。语法角色与三测的判断归你 —— 词表由你（模型）先列，
-本工具负责按词表回源文件取原句；给不出 words 时它只列源文件清单，不替你猜词。
-【输出格式】词 | 语法角色 | 三测 | 各源文件原句（每文件一行）`,
-
+        description: `划分语义：读文件正文，调模型做语义划分并自检，通过后落盘到 语义/<主名>-语义.txt。
+【参数】
+- file：被划分的源文件，绝对路径，必填。
+【行为】
+- 读文件正文。
+- 调模型划分（当前会话的 provider/model，temperature 0，不思考）。
+- 自检：一句一行、行序同源文、一字不改、组间恰好一个空行、每句都在且不重复。
+- 不通过就不落盘，带问题清单重试（最多 3 次）；仍不通过则保留旧语义文件并报错。
+- 通过后写 源文件同目录/语义/<主名>-语义.txt；源文件不动。`,
         parameters: {
-            words: {
-                type: 'array',
-                items: { type: 'string' },
-                description: '词表。推荐显式给（先由你/用户列词，工具按词回源取原句）'
-            },
             file: {
                 type: 'string',
-                description: '拆解的起点文件（可选；给了就只扫这一个文件，缺省扫描工作区全部文本文件）'
+                required: true,
+                description: '被划分的源文件，绝对路径',
             },
-            workspace: {
-                type: 'string',
-                description: '工作区目录绝对路径。缺省用会话 cwd'
-            },
-            depth: {
-                type: 'number',
-                description: '目录深度，默认 3'
-            }
         },
-
         output: {
             schema: { type: 'string' },
-            render: (_args, value) => [{ type: 'text', text: value }]
+            render: (_args, value) => [{ type: 'text', text: value }],
         },
 
         async execute(args, exec) {
             try {
-                const { words: rawWords, file, depth = 3 } = args ?? {}
+                const file = String(args?.file ?? '').trim()
+                if (!file) return '拆解失败：缺少 file 参数（被划分的源文件绝对路径）'
+                if (!path.isAbsolute(file)) return `拆解失败：file 必须是绝对路径（${file}）`
 
-                // ── 解析工作区路径（与 find_sources / annotate 同链）──
-                let cwd = null
-                try {
-                    cwd = exec?.agent?.session?.header?.cwd ?? null
-                } catch (err) {
-                    console.warn('[decompose] 读取 agent.session 失败：', err?.message ?? err)
-                }
-                if (!cwd) {
-                    let sessionId = null
-                    try { sessionId = exec?.agent?.id ?? exec?.sessionId ?? null } catch {}
-                    const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
-                    if (sessionId && sessions?.get) {
-                        try {
-                            const session = await sessions.get(sessionId)
-                            cwd = session?.header?.cwd ?? session?.meta?.cwd ?? null
-                        } catch (err) {
-                            console.warn('[decompose] 读取会话失败：', err?.message ?? err)
-                        }
-                    }
-                }
-                const registry = typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : undefined
-                let wsPath = null
-                if (cwd && registry?.resolveByPath) {
-                    try {
-                        const ws = await registry.resolveByPath(cwd)
-                        wsPath = ws?.path ?? null
-                    } catch (err) {
-                        console.warn('[decompose] resolveByPath 失败：', err?.message ?? err)
-                    }
-                }
-                const basePath = args.workspace ?? wsPath ?? cwd ?? fallbackWorkspace ?? process.cwd()
-                if (!path.isAbsolute(basePath)) {
-                    return `拆解失败：无法解析工作区路径（${basePath}）`
-                }
+                // ── 1. 读正文 ──
+                const raw = await fs.readFile(file, 'utf-8').catch(() => null)
+                if (raw === null) return `拆解失败：文件读不了（${file}）`
+                const body = raw.replace(/^\uFEFF/u, '').trim()
+                if (!body) return `拆解失败：文件没有正文（${file}）`
 
-                // ── 扫描源文件 ──
-                let files = []
-                if (file) {
-                    let fp = file
-                    if (!path.isAbsolute(fp)) fp = path.join(basePath, fp)
-                    try {
-                        await fs.access(fp)
-                    } catch {
-                        return `文件不存在：${file}`
-                    }
-                    const text = await fs.readFile(fp, 'utf-8')
-                    const parsed = parsePrompt(text)
-                    files = [{
-                        relPath: path.relative(basePath, fp).replace(/\\/g, '/'),
-                        sentences: splitSentences(parsed.ok ? parsed.body : text),
-                    }]
-                } else {
-                    files = await scanDir(basePath, depth, basePath, [])
-                }
+                // ── 2. 调模型 + 自检 + 重试 ──
+                let report = null
+                let noteText = ''
+                let attempts = 0
 
-                const words = (rawWords ?? []).map(w => String(w).trim()).filter(Boolean)
+                for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+                    attempts = attempt
+                    const prompt = attempt === 1
+                        ? body
+                        : `${body}\n\n—— 上一轮输出不合格，问题如下 ——\n${feedbackFor(report)}\n请按格式重做，只输出列表。`
 
-                // ── 没有词表：只列源文件，不替模型猜词 ──
-                if (words.length === 0) {
-                    const out = []
-                    out.push(`扫描范围：${file ? file : basePath}（深度 ${depth}）`)
-                    out.push(`源文件 ${files.length} 个（已跳过 注释关系-* 与 提示词 产物）`)
-                    for (const f of files) out.push(`  · ${f.relPath}`)
-                    out.push('─'.repeat(48))
-                    out.push('没有给定词表。请先用 words 参数传入词表（词由你/用户先列：')
-                    out.push('中文语法切出主谓宾、偏正、动宾的中心语，过 指称 / 引用 / 节点 三测），')
-                    out.push('本工具再把每个词在各源文件里的原句取回来。')
-                    return out.join('\n')
-                }
+                    const r = await callModel(ctx, exec, prompt)
+                    if (!r.ok) return `拆解失败：${r.error}`
 
-                // ── 逐词回源取原句 ──
-                const out = []
-                out.push(`扫描范围：${file ? file : basePath}（深度 ${depth}）`)
-                out.push(`源文件 ${files.length} 个（已跳过 注释关系-* 与 提示词 产物）`)
-                out.push(`词表 ${words.length} 个`)
-                out.push('─'.repeat(48))
-
-                const noHit = []
-                for (const word of words) {
-                    const perFile = []
-                    for (const f of files) {
-                        const hits = findExact(f.sentences.join('\n'), word)
-                        if (hits.length === 0) continue
-                        const sentence = pickSentence(f.sentences, word)
-                        perFile.push({ relPath: f.relPath, sentence, count: hits.length })
-                    }
-
-                    out.push(`词：${word}`)
-                    out.push('  语法角色：（你判）｜三测：（你判：指称 / 引用 / 节点）')
-                    if (perFile.length === 0) {
-                        out.push('  原句：无（该词在各源文件里都没逐字出现 —— 词面校验不过，建议剔除）')
-                        noHit.push(word)
+                    const lines = parseSemantic(r.text)
+                    if (!lines.some(Boolean)) {
+                        report = { bad: [], missing: [], problems: ['模型没有输出语义单元'] }
                         continue
                     }
-                    out.push(`  原句（${perFile.length} 份源文件命中）：`)
-                    for (const p of perFile.slice(0, FILE_LIMIT)) {
-                        out.push(p.sentence
-                            ? `    ${p.relPath}：${p.sentence}`
-                            : `    ${p.relPath}（有命中，但整句超过 ${SENTENCE_MAX} 字，切不了 —— 只写文件名）`)
-                    }
+
+                    noteText = renderSemantic(lines)
+                    report = checkNotes(body, noteText)
+                    if (report.ok) break
                 }
 
-                if (noHit.length) {
-                    out.push('─'.repeat(48))
-                    out.push(`**词面校验不过（源文件里查无此词）：${noHit.join('、')}`)
+                // ── 3. 检查不过：不落盘，保留旧文件 ──
+                if (!report?.ok) {
+                    const detail = [
+                        report?.bad.length ? `保真未过：\n` + report.bad.map(l => `  · ${l}`).join('\n') : '',
+                        report?.missing.length ? `覆盖未过：\n` + report.missing.map(l => `  · ${l}`).join('\n') : '',
+                        report?.problems.length ? `结构未过：\n` + report.problems.map(l => `  · ${l}`).join('\n') : '',
+                    ].filter(Boolean).join('\n')
+                    return [
+                        `拆解失败：${attempts} 次尝试均未通过自检，未落盘（旧语义文件未改动）`,
+                        `源文件：${file}`,
+                        detail || '原因未知',
+                    ].join('\n')
                 }
-                out.push('？ 以上只是原句与命中事实；词收不收、三测过不过，由你判断 —— 工具不表态')
 
+                // ── 4. 落盘 ──
+                const outPath = semanticPathFor(file, path)
+                await fs.mkdir(path.dirname(outPath), { recursive: true })
+                await fs.writeFile(outPath, noteText.replace(/^\uFEFF/u, ''), 'utf-8')
+
+                // ── 5. 回报 ──
+                const out = [
+                    `已划分 ${report.groupCount} 组，共 ${report.noteCount} 句`,
+                    `源文件：${file}`,
+                    `输出：${outPath}`,
+                    `保真：通过（${report.noteCount} 行逐行对上原文）`,
+                    `覆盖：通过（源文 ${report.sentenceCount} 句）`,
+                    `结构：通过（一句一行、组间一个空行）`,
+                ]
+                if (attempts > 1) out.push(`注：第 ${attempts} 次尝试才通过自检`)
                 return out.join('\n')
             } catch (err) {
                 return `拆解失败：${err?.message ?? err}`
             }
-        }
+        },
     })
 }

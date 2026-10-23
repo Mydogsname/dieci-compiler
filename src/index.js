@@ -1,43 +1,30 @@
-import { makeAnnotateTool } from './tools/annotate.js'
-import { makeParsePromptTool } from './tools/parse_prompt.js'
-import { makeFindSourcesTool } from './tools/find_sources.js'
 import { makeDecomposeTool } from './tools/decompose.js'
-import { registerDieciCommand } from './save_command.js'
+import { makeCheckNotesTool } from './tools/check_notes.js'
+import { makeDieciTool } from './tools/dieci.js'
+import { makeComposeTool } from './tools/compose.js'
+import { registerChainCommand } from './commands/chain.js'
 import { DIECI_GUIDE } from './guide.js'
 
 export const name = 'dieci-compiler'
 
-// sessions 和 workspaceRegistry 是可选宿主能力
-// 它们由 dsh-workspace 提供，宿主未加载时插件保持 pending
-export const inject = ['tools', 'sessions', 'workspaceRegistry', 'commands']
+// 只声明真正用到的宿主能力：tools 是三个工具的唯一依赖。
+// llm 由 ctx.get('llm') 运行时取，缺了只是调不到模型，不会让插件停在 pending。
+// commands / systemPrompt 走可选注入，宿主没有就自动降级。
+export const inject = ['tools']
 
-export function apply(ctx, config = {}) {
-  // 补全注释：往已有叠词文件的注释区填/追加条目
-  ctx.tools.register(makeAnnotateTool({
-    ctx,
-    fallbackWorkspace: config.workspace
-  }))
+export function apply(ctx) {
 
-  // 只读检查：看叠词文件的注释状态（待补/缺依据/未识别行/警告），不写盘
-  ctx.tools.register(makeParsePromptTool({
-    ctx,
-    fallbackWorkspace: config.workspace
-  }))
+  // 拆解：源正文 → 语义单元，自检通过才落盘
+  ctx.tools.register(makeDecomposeTool({ ctx }))
 
-  // 跨文件找来源与已有定义（只读）
-  ctx.tools.register(makeFindSourcesTool({
-    ctx,
-    fallbackWorkspace: config.workspace
-  }))
+  // 检查：语义文件 ↔ 源文件对账（只读）
+  ctx.tools.register(makeCheckNotesTool())
 
-  // 拆解：源正文 → 词表候选（词 | 语法角色 | 三测 | 各源文件原句）（只读）
-  ctx.tools.register(makeDecomposeTool({
-    ctx,
-    fallbackWorkspace: config.workspace
-  }))
+  // 叠词：多份语义文件 → 注释（词：原句）+ 残句
+  ctx.tools.register(makeDieciTool({ ctx }))
 
-  // /dieci <主题>：建骨架 + 把成文任务派给模型
-  registerDieciCommand(ctx)
+  // 成品：注释 + 残句 → 成稿
+  ctx.tools.register(makeComposeTool({ ctx }))
 
   // 系统提示段落：让每个会话默认明白叠词工作流的思路
   // 写法 A（优雅降级）：宿主没有 systemPrompt 服务时，其余工具照常工作
@@ -47,5 +34,11 @@ export function apply(ctx, config = {}) {
       order: 116,
       text: DIECI_GUIDE,
     })
+  })
+
+  // /chain：一条命令串 check_notes → decompose → check_notes → dieci
+  // 可选注入：宿主没有 commands 服务时，三个工具照常工作
+  ctx.inject(['commands'], (cmdCtx) => {
+    registerChainCommand(cmdCtx)
   })
 }
