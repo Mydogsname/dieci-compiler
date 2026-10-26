@@ -2,7 +2,7 @@ import { makeDecomposeTool } from './tools/decompose.js'
 import { makeCheckNotesTool } from './tools/check_notes.js'
 import { makeDieciTool } from './tools/dieci.js'
 import { makeComposeTool } from './tools/compose.js'
-import { registerChainCommand } from './commands/chain.js'
+import { registerDieciCommand } from './commands/dieci.js'
 import { DIECI_GUIDE } from './guide.js'
 
 export const name = 'dieci-compiler'
@@ -36,9 +36,9 @@ export function apply(ctx) {
     })
   })
 
-  // /chain：一条命令串 check_notes → decompose → check_notes → dieci
-  // 可选注入：宿主没有 commands 服务时，三个工具照常工作
+  // /dieci：一条命令串 check_notes → decompose → check_notes → dieci → compose
+  // 可选注入：宿主没有 commands 服务时，四个工具照常工作
   ctx.inject(['commands'], (cmdCtx) => {
-    registerChainCommand(cmdCtx)
+    registerDieciCommand(cmdCtx)
   })
 }

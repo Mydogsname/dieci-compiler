@@ -26,25 +26,26 @@ pnpm dsh plugin --profile <profile> remove dieci-compiler
 
 ## 装完有什么
 
-**三个工具**
+**四个工具**
 
 | 工具 | 读写 | 作用 |
 |---|---|---|
 | `decompose` | 写 `语义/` | 正文 → 语义文件；自检通过才落盘，否则重试（最多 3 次）后报错不写 |
 | `check_notes` | **只读** | 语义文件 ↔ 源文件对账：一句一行、保真、覆盖、组间空行 |
-| `dieci` | 只读（可选落盘） | 多份语义文件 → 词与句的跨文件配对，可按 `out` 写文件 |
+| `dieci` | 只读（可选落盘） | 多份语义文件 → 词与句的跨文件配对，写出「注释」与「残句」两份数据文件 |
+| `compose` | 只读（可选落盘） | 注释 + 残句 → 成稿：首行「主题：」，正文只用这两块原料里的事实与用词 |
 
 **一条命令**
 
 | 命令 | 参数 | 作用 |
 |---|---|---|
-| `/chain` | 无 | 处理工作区全部 `.md`/`.txt`：逐份自检 → 缺/不合格的补 `decompose` 并复核 → 全部通过后 `dieci`，产物写 `<工作区>\叠词.txt` |
+| `/dieci` | 无 | 处理工作区全部 `.md`/`.txt`：逐份自检 → 缺/不合格的补 `decompose` 并复核 → 全部通过后 `dieci` → `compose`，产物按成品的「主题：」行命名：`<工作区>\叠词\<标题>.txt`、`<工作区>\叠词\<标题>-注释.txt`、`<工作区>\<标题>-残句.txt` |
 
 命令名受宿主约束：`^[a-z][a-z0-9_-]*$`，中文名不可用。
 
 **一段系统提示** —— 每个会话默认就懂叠词工作流（`tool:dieci`，order 116）。
 
-> `/dieci`、`/save` 仍未实现；`/chain` 是唯一实现的命令。
+> `/dieci` 是唯一实现的命令；`/save` 仍未实现。命令名只能是 `[a-z][a-z0-9_-]*`，中文名不可用。
 
 ## 工作流
 
@@ -56,7 +57,13 @@ pnpm dsh plugin --profile <profile> remove dieci-compiler
 
 `dieci` 在读素材前会先用同一份判据复核语义文件，不合格直接拒，不自动重新划分。
 
-`/chain` 把上面这条链固化：`check_notes` 当闸门，缺/不合格才补 `decompose`，复核通过后进 `dieci`，任一步失败即中止并回前序步骤。素材取自工作区（递归，跳过 `语义\`、`node_modules`、`.git` 等目录和自己的产物），上限 30 份。
+`/dieci` 把上面这条链固化：`check_notes` 当闸门，缺/不合格才补 `decompose`，复核通过后进 `dieci`，任一步失败即中止并回前序步骤。素材取自工作区（递归，跳过 `语义\`、`叠词\`、`node_modules`、`.git` 等目录），上限 30 份。
+
+产物名跟着成品走：`dieci` 与 `compose` 先写工作名 `叠词-注释.txt` / `叠词-残句.txt` / `叠词.txt`，`compose` 出主题后由 `/dieci` 改名——**注释与成品进 `叠词\`**（`<工作区>\叠词\<标题>-注释.txt`、`<工作区>\叠词\<标题>.txt`），**残句留在根目录**（`<工作区>\<标题>-残句.txt`）。标题取主题行的 `主题：` 之后那一段，剔除 `\ / : * ? " < > |` 等文件名非法字符，超 60 字截断；模型没给主题行时兜底叫 `叠词`。
+
+**下一轮不重吃产物**：`叠词\` 在 `SKIP_DIRS` 里，注释与成品天然被跳过；残句靠 `GENERATED` 的 `-残句.txt$` 规则排除。所以重跑 `/dieci` 时素材仍是原来那几份。
+
+单跑 `compose` 时注意：只给 `note` 的话，残句按「同目录、`-注释.txt` → `-残句.txt`」推导，而残句现在在上一级目录——得显式传 `residual`，否则按「无残句」处理。
 
 ## 文件格式
 
@@ -76,17 +83,17 @@ pnpm dsh plugin --profile <profile> remove dieci-compiler
 3. **覆盖**：源文每句都入语义文件，不多不少、不重复
 4. **结构**：组与组之间恰好一个空行
 
-注释格式（`dieci` 的产出）：`词：原句（来源文件）`，续行按两空格缩进。
+注释格式（`dieci` 的产出）：`词：原句`，续行按两空格缩进。
 
 ## 源码结构
 
 ```
 src/
-├─ index.js        入口：注册三个工具 + 可选挂 /chain 与系统提示段
+├─ index.js        入口：注册四个工具 + 可选挂 /dieci 与系统提示段
 ├─ guide.js        系统提示段正文
 ├─ core/text.js    判据本体：切句 / 解析 / 比对 / 路径（无 fs、无模型）
-├─ tools/          decompose.js · check_notes.js · dieci.js
-└─ commands/chain.js
+├─ tools/          decompose.js · check_notes.js · dieci.js · compose.js
+└─ commands/dieci.js    /dieci：check_notes → decompose → check_notes → dieci → compose
 ```
 
 ## 配置

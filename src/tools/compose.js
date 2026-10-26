@@ -150,6 +150,16 @@ function splitTheme(text) {
     return { theme: m[1].trim(), body }
 }
 
+/**
+ * 成品文本里的主题——命令 /dieci 靠它决定产物文件名。
+ * 模型没写主题行时返回空串，由调用方决定兜底名字。
+ * @param {string} productText 成品全文（首行「主题：…」加一段空行加正文）
+ * @returns {string}
+ */
+export function themeOf(productText) {
+    return splitTheme(productText).theme
+}
+
 // ─── 工具工厂 ───
 export function makeComposeTool({ ctx } = {}) {
     return defineTool({
