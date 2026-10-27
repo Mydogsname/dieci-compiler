@@ -175,3 +175,21 @@ export function sourceBaseName(file) {
 export function semanticPathFor(file, path) {
     return path.join(path.dirname(file), '语义', `${sourceBaseName(file)}-语义.txt`)
 }
+
+/** 文件名里不能出现的字符 */
+const ILLEGAL_IN_NAME = /[\\/:*?"<>|\u0000-\u001f]/gu
+
+/**
+ * 工作区名字：取根目录的目录名，当作产物的名字前缀。
+ * 会话头里没有工作区标题（SessionHeader 只有 cwd），所以名字只能从 cwd 取。
+ * @param {string} root 工作区绝对路径
+ * @returns {string} 清洗过的目录名；取不到时回落字面量 '工作区'
+ */
+export function workspaceName(root) {
+    const raw = sourceBaseName(String(root ?? '').replace(/[\\/]+$/u, ''))
+    const cleaned = raw
+        .replace(ILLEGAL_IN_NAME, '')
+        .replace(/\s+/gu, ' ')
+        .trim()
+    return cleaned || '工作区'
+}

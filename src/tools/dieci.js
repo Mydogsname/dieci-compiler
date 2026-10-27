@@ -8,7 +8,7 @@ import { checkNotes, semanticPathFor } from '../core/text.js'
  * dieci —— 多份语义文件 → 两份数据文件。
  *
  *   1. 注释：逐行「词：原句」，同词多句两空格缩进续行。逐字取自语义文件，不加工。
- *   2. 残句：没被任何词引用的句子，一行一句，前置（来源文件）。
+ *   2. 剩余文本：没被任何词引用的句子，一行一句，前置（来源文件）。
  *
  * 本工具只出数据，不写成稿——成稿由 compose 读这两份文件产出。
  *
@@ -220,7 +220,7 @@ function resolveRefs(loaded, parsed) {
 }
 
 /**
- * 没被任何词认领的句子，按素材顺序收集——残句文件的来源。
+ * 没被任何词认领的句子，按素材顺序收集——剩余文本文件的来源。
  * @returns {Array<{ source: string, sentence: string }>}
  */
 function collectLeftovers(loaded, claimed) {
@@ -249,7 +249,7 @@ function renderAnnotation(resolved) {
 }
 
 /**
- * 残句正文：一行一句，前置（来源文件），原样不改。
+ * 剩余文本正文：一行一句，前置（来源文件），原样不改。
  */
 function renderResidual(leftovers) {
     return leftovers.length
@@ -263,7 +263,7 @@ function renderPanel(loaded, resolved, leftovers, paths) {
     const lines = [
         `已配对 ${loaded.length} 份语义文件：${loaded.map(m => m.name).join(' / ')}`,
         `注释：${resolved.entries.length} 个词、${pairs} 条（每句只归一个词）。`,
-        `残句：${leftovers.length} 句未被引用。`,
+        `剩余文本：${leftovers.length} 句未被引用。`,
     ]
 
     if (!resolved.entries.length) lines.push('', '未形成任何词的关联，注释为空。')
@@ -282,7 +282,7 @@ function renderPanel(loaded, resolved, leftovers, paths) {
     if (notes.length) lines.push('', ...notes.map(n => `注：${n}`))
 
     if (paths.outNote) lines.push('', `注释已落盘：${paths.outNote}`)
-    if (paths.outResidual) lines.push(`残句已落盘：${paths.outResidual}`)
+    if (paths.outResidual) lines.push(`剩余文本已落盘：${paths.outResidual}`)
     return lines.join('\n')
 }
 
@@ -290,15 +290,15 @@ function renderPanel(loaded, resolved, leftovers, paths) {
 export function makeDieciTool({ ctx } = {}) {
     return defineTool({
         name: 'dieci',
-        description: `叠词（dieci）：读多份已划分的语义文件，产出「注释」与「残句」两份数据文件。
+        description: `叠词（dieci）：读多份已划分的语义文件，产出「注释」与「剩余文本」两份数据文件。
 【参数】
 - materials：源文件绝对路径数组，至少 2 个。工具自动推导 语义/<主名>-语义.txt。
 - direction：配对维度，可选：entity（按实体）、topic（按主题）、attribute（按属性）；不传由模型从素材推断。
 - out：注释文件落盘路径（可选）。
-- outResidual：残句文件落盘路径（可选；只给 out 时派生为同目录 <主名>-残句.txt）。
+- outResidual：剩余文本文件落盘路径（可选；只给 out 时派生为同目录 <主名>-剩余.txt）。
 【产物】
 - 注释：逐行「词：原句」，同词多句两空格缩进续行。逐字取自语义文件，不加工。
-- 残句：没被任何词引用的句子，一行一句，前置（来源文件）。
+- 剩余文本：没被任何词引用的句子，一行一句，前置（来源文件）。
 【纪律】
 - 模型只报 {src, s} 序号，原句由工具回填，杜绝改字。
 - 同一句只能属于一个注释，重复引用丢弃。
@@ -322,7 +322,7 @@ export function makeDieciTool({ ctx } = {}) {
             },
             outResidual: {
                 type: 'string',
-                description: '残句文件落盘路径（可选）',
+                description: '剩余文本文件落盘路径（可选）',
             },
         },
         output: {
@@ -356,7 +356,7 @@ export function makeDieciTool({ ctx } = {}) {
                 }
                 if (!outResidual && outNote) {
                     const base = path.basename(outNote).replace(/\.txt$/iu, '')
-                    outResidual = path.join(path.dirname(outNote), `${base}-残句.txt`)
+                    outResidual = path.join(path.dirname(outNote), `${base}-剩余.txt`)
                 }
 
                 // ── 1. 逐份复核语义文件，读出一句一行 ──
@@ -435,7 +435,7 @@ export function makeDieciTool({ ctx } = {}) {
                     '—— 注释 ——',
                     annotation.trimEnd() || '（空）',
                     '',
-                    '—— 残句 ——',
+                    '—— 剩余文本 ——',
                     residual.trimEnd() || '（空）',
                 ].join('\n')
             } catch (err) {

@@ -2,7 +2,10 @@ import { makeDecomposeTool } from './tools/decompose.js'
 import { makeCheckNotesTool } from './tools/check_notes.js'
 import { makeDieciTool } from './tools/dieci.js'
 import { makeComposeTool } from './tools/compose.js'
+import { makeSupplementTool } from './tools/supplement.js'
 import { registerDieciCommand } from './commands/dieci.js'
+import { registerSupplementCommand } from './commands/supplement.js'
+import { registerComposeCommand } from './commands/compose.js'
 import { DIECI_GUIDE } from './guide.js'
 
 export const name = 'dieci-compiler'
@@ -20,11 +23,14 @@ export function apply(ctx) {
   // 检查：语义文件 ↔ 源文件对账（只读）
   ctx.tools.register(makeCheckNotesTool())
 
-  // 叠词：多份语义文件 → 注释（词：原句）+ 残句
+  // 叠词（无题提取）：多份语义文件 → 注释（词：原句）+ 剩余文本
   ctx.tools.register(makeDieciTool({ ctx }))
 
-  // 成品：注释 + 残句 → 成稿
+  // 成品：注释 + 剩余文本 → 成稿
   ctx.tools.register(makeComposeTool({ ctx }))
+
+  // 补充（有题提取）：剩余文本 + 题目 → 主题注释表
+  ctx.tools.register(makeSupplementTool({ ctx }))
 
   // 系统提示段落：让每个会话默认明白叠词工作流的思路
   // 写法 A（优雅降级）：宿主没有 systemPrompt 服务时，其余工具照常工作
@@ -37,8 +43,14 @@ export function apply(ctx) {
   })
 
   // /dieci：一条命令串 check_notes → decompose → check_notes → dieci → compose
-  // 可选注入：宿主没有 commands 服务时，四个工具照常工作
+  // 可选注入：宿主没有 commands 服务时，五个工具照常工作
   ctx.inject(['commands'], (cmdCtx) => {
     registerDieciCommand(cmdCtx)
+
+    // /supplement <题目>：有题提取，只做一步，不接 compose
+    registerSupplementCommand(cmdCtx)
+
+    // /compose：叠 叠词\ 下全部注释表 + 剩余文本 → 叠词\成品.txt
+    registerComposeCommand(cmdCtx)
   })
 }
