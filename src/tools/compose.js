@@ -17,7 +17,8 @@ import { workspaceName } from '../core/text.js'
  *   再其余 <题目>-注释.txt（supplement 的有题划分，补规格与约束）。
  * 不给路径时自动扫 <工作区>\叠词\，按这个顺序拼。
  *
- * 成品首行是「主题：…」——主题只能由注释里出现过的词组成，用来约束成稿不跑题。
+ * 成品首行是「主题：…」——不给 theme 时主题只能由注释里出现过的词组成，用来约束成稿不跑题；
+ * 给了 theme 就把那句写死当首行，模型只负责把正文写紧扣，不得改主题的措辞。
  */
 
 const OFF_EFFORT = ReasoningEffortId('off')
@@ -31,6 +32,12 @@ const EFFORT_REJECTED = /reasoning effort|推理档/i
 /** 成品首行的主题行 */
 const THEME_LINE = /^主题[:：]\s*(.+)$/u
 
+/** 用户写主题时常带的前缀，读入时剥掉 */
+const THEME_PREFIX = /^主题[:：]\s*/u
+
+/** 指定主题的长度上限（成品首行要能一行放下） */
+const THEME_MAX = 200
+
 /** 注释里的条目行：顶格的「词：」；缩进行是续行 */
 const ENTRY_LINE = /^([^：:\s][^：:]{0,19})[:：]\s*\S/u
 
@@ -40,13 +47,26 @@ const OUT_DIR = '叠词'
 /** 注释表后缀：<题目>-注释.txt，题目即主题 */
 const PLAIN_SUFFIX = '-注释.txt'
 
-const SYSTEM = `你是成稿器。用户给你两块原料，此外没有别的材料。
+/**
+ * 成稿器的系统提示。
+ * 主题由谁定，决定任务第 1 步是「拟定」还是「照办」：
+ *   · givenTheme 为空 —— 模型自己定主题（缺省行为，与旧版输出逐字相同）；
+ *   · givenTheme 有值 —— 主题已经定了，模型只负责把正文写紧扣，且不得改主题的措辞。
+ * @param {string} givenTheme 用户指定的主题（已归一）；空串表示由模型自定
+ * @returns {string}
+ */
+function systemFor(givenTheme) {
+    const themeStep = givenTheme
+        ? `1. 主题已由用户指定：「${givenTheme}」。你不要另行拟定，也不要改动它的措辞；正文必须紧扣这个主题。`
+        : '1. 定主题：一句话，必须由注释里出现过的词组合而成，不许引入注释中没有的实体、风格或情绪。'
+
+    return `你是成稿器。用户给你两块原料，此外没有别的材料。
 
 【注释】一个词一条，词后面是与之相关的原句；两空格缩进的续行属于同一条。
 【剩余文本】不属于任何词的零散句子，括号里是来源文件。
 
 任务：
-1. 定主题：一句话，必须由注释里出现过的词组合而成，不许引入注释中没有的实体、风格或情绪。
+${themeStep}
 2. 写成稿正文：一段或几段连贯、可直接使用的中文文字。
 
 成稿规则：
@@ -59,7 +79,8 @@ const SYSTEM = `你是成稿器。用户给你两块原料，此外没有别的�
 **舍弃要说清**：你按主题砍掉了哪一支，就逐条报出来——砍的是什么（原料里的哪个词、哪些句子所属的那一类），为什么砍（与主题或与哪条约束冲突）。没砍就报空数组。这些只进面板给用户看，不进正文。
 
 直接输出 JSON：
-{ "theme": "主题", "body": "成稿正文", "dropped": [ { "what": "被舍弃的部分", "why": "为什么舍弃" } ] }`
+{ "theme": "${givenTheme ? '原样回传用户指定的主题，一个字都不要改' : '主题'}", "body": "成稿正文", "dropped": [ { "what": "被舍弃的部分", "why": "为什么舍弃" } ] }`
+}
 
 /**
  * 把一次截断说清楚：上限多少、正文与推理各产出多少字。
@@ -137,6 +158,36 @@ async function callModel(ctx, exec, system, prompt) {
     }
 }
 
+/**
+ * 归一用户给的 theme：换行并成空格、去「主题：」前缀、去首尾空白。
+ * 成品首行必须能一行放下，所以这里就把多行压平。
+ * @param {unknown} raw
+ * @returns {string} 归一后的主题；空串表示没指定
+ */
+function normalizeTheme(raw) {
+    const flat = String(raw ?? '')
+        .replace(/\r\n?/gu, '\n')
+        .split('\n')
+        .map(l => l.trim())
+        .filter(Boolean)
+        .join(' ')
+        .trim()
+        .replace(/[ \t\u3000]+/gu, ' ')
+    return flat.replace(THEME_PREFIX, '').trim()
+}
+
+/**
+ * 主题是不是同一句：忽略空白、末尾标点、以及模型可能带回的「主题：」前缀。
+ * 模型在 temperature 0 下也常给你补个句号，不该因此报「与指定不符」。
+ */
+function sameTheme(a, b) {
+    const norm = (s) => String(s ?? '')
+        .replace(THEME_PREFIX, '')
+        .replace(/\s+/gu, '')
+        .replace(/[。.！!？?，,、；;：:]+$/u, '')
+    return norm(a) === norm(b)
+}
+
 /** 注释里的词（顶格条目的词），用来校验主题没跑出注释之外。 */
 function noteTerms(noteText) {
     const terms = []
@@ -172,14 +223,14 @@ function splitTheme(text) {
 function parseProduct(raw) {
     const check = (v) => {
         if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('顶层不是对象')
-        if (typeof v.theme !== 'string') throw new Error('theme 不是字符串')
+        if (v.theme !== undefined && typeof v.theme !== 'string') throw new Error('theme 不是字符串')
         if (typeof v.body !== 'string' || !v.body.trim()) throw new Error('body 缺失或为空')
         const dropped = Array.isArray(v.dropped) ? v.dropped : []
         for (const [i, d] of dropped.entries()) {
             if (!d || typeof d !== 'object') throw new Error(`dropped[${i}] 不是对象`)
         }
         return {
-            theme: v.theme.trim(),
+            theme: typeof v.theme === 'string' ? v.theme.trim().replace(THEME_PREFIX, '') : '',
             body: v.body.trim(),
             dropped: dropped
                 .map(d => ({
@@ -256,13 +307,16 @@ export function makeComposeTool({ ctx } = {}) {
     再其余 <题目>-注释.txt（supplement 的有题划分，补规格与约束）。
 - note：单份注释表绝对路径，可选，等价于只给一份 notes。
 - residual：剩余文本绝对路径，可选；缺省 <工作区>\\\\<工作区名>-剩余.txt。不存在按「无剩余文本」处理。
+- theme：指定主题，可选。给了就不再让模型自定，成品首行逐字用这句（剥「主题：」前缀、多行压成一行），
+    模型只负责把正文写紧扣；主题里含注释表外的词只面板标注，不阻断。
 - out：成品落盘路径，可选；不传只在返回里给文本。
 【原料边界】
 - 只有注释表与剩余文本两块，不读源文件、不读语义文件、不重新配对。
-- 成品首行「主题：…」，主题只能由注释表里出现过的词组成。
+- 成品首行「主题：…」；不给 theme 时主题只能由注释表里出现过的词组成。
 【纪律】
 - 注释表里没有注释条目时直接报错，不猜。
-- 主题若含注释表外的成分，面板告警但不改动成品。`,
+- 不给 theme 时，主题若含注释表外的成分，面板告警但不改动成品。
+- 给了 theme 时人工指定优先：主题含表外成分只标注，不改写你写的字。`,
         parameters: {
             notes: {
                 type: 'array',
@@ -276,6 +330,10 @@ export function makeComposeTool({ ctx } = {}) {
             residual: {
                 type: 'string',
                 description: '剩余文本绝对路径（可选，缺省取 <工作区>\\\\<工作区名>-剩余.txt）',
+            },
+            theme: {
+                type: 'string',
+                description: '指定主题（可选）：给了就写死成品首行，模型不再自定；含注释表外的词只标注不阻断',
             },
             out: {
                 type: 'string',
@@ -292,6 +350,12 @@ export function makeComposeTool({ ctx } = {}) {
                 const outArg = String(args?.out ?? '').trim()
                 if (outArg && !path.isAbsolute(outArg)) {
                     return `成稿失败：out 必须是绝对路径（${outArg}）`
+                }
+
+                // 指定主题：归一后非空才算「用户定了主题」
+                const givenTheme = normalizeTheme(args?.theme)
+                if (givenTheme.length > THEME_MAX) {
+                    return `成稿失败：theme 太长（上限 ${THEME_MAX} 字，收到 ${givenTheme.length} 字）`
                 }
 
                 const root = workspaceRoot(exec)
@@ -353,13 +417,15 @@ export function makeComposeTool({ ctx } = {}) {
                     residualText ? '\n【剩余文本】\n' + residualText : '',
                 ].filter(Boolean).join('\n')
 
-                const r = await callModel(ctx, exec, SYSTEM, prompt)
+                const r = await callModel(ctx, exec, systemFor(givenTheme), prompt)
                 if (!r.ok) return `成稿失败：${r.error}`
 
                 // ── 5. 解析成品：主题 + 正文 + 舍弃清单 ──
-                const { theme, body, dropped, json } = parseProduct(r.text)
+                const { theme: modelTheme, body, dropped, json } = parseProduct(r.text)
                 if (!body) return `成稿失败：模型没有给出正文\n原始输出：${r.text.slice(0, 400)}`
 
+                // 主题优先用用户指定的那句，一个字不改
+                const theme = givenTheme || modelTheme
                 const productText = theme ? `主题：${theme}\n\n${body}\n` : body + '\n'
 
                 // ── 6. 落盘 ──
@@ -371,10 +437,17 @@ export function makeComposeTool({ ctx } = {}) {
                 // ── 7. 回报 ──
                 const notes = []
                 if (!json) notes.push('模型没按 JSON 输出，舍弃清单缺失（其余照常）')
-                if (!theme) notes.push('模型未给出主题，成品只有正文')
+                if (givenTheme && modelTheme && !sameTheme(givenTheme, modelTheme)) {
+                    notes.push(`模型自拟的主题与指定不符，已按你给的原样写入；模型给的是：${modelTheme}`)
+                }
+                if (!theme) notes.push('主题既没有指定、模型也没给出，成品只有正文')
                 else {
                     const stray = allTerms.length && !allTerms.some(t => theme.includes(t))
-                    if (stray) notes.push(`主题未包含任何注释里的词，请核对：${theme}`)
+                    if (stray) {
+                        notes.push(givenTheme
+                            ? `主题含注释表外的成分（成稿可能据此编造），已按你给的原文落盘：${theme}`
+                            : `主题未包含任何注释里的词，请核对：${theme}`)
+                    }
                 }
                 if (!residualText) notes.push(`无剩余文本，原料只有注释表（${residualPath} 不存在）`)
 
@@ -393,6 +466,7 @@ export function makeComposeTool({ ctx } = {}) {
                     '',
                     `已落盘：${outArg || '（未指定 out，仅返回文本）'}`,
                     `原料：${parts.length} 层注释（${parts.map(p => path.basename(p.path)).join(' / ')}）${residualText ? ' + 剩余文本' : ''}`,
+                    `主题：${givenTheme ? '用户指定' : modelTheme ? '模型自定' : '无'}`,
                     ...droppedLines,
                     ...notes.map(n => `注：${n}`),
                 ].join('\n')
