@@ -14,7 +14,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://gitee.com/ddtsc/dieci-dsh.git"
+    "url": "git+https://gitee.com/ddtsc/dieci-compiler.git"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1",
