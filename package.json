@@ -17,8 +17,8 @@
     "url": "git+https://github.com/Mydogsname/dieci-compiler.git"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1",
-    "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1"
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.1"
   },
   "files": [
     "src/**/*.js",

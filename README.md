@@ -4,12 +4,27 @@
 
 ## 安装
 
+从 GitHub 装：
+
+```sh
+pnpm dsh plugin --profile <profile> add github:Mydogsname/dieci-compiler
+```
+
+从本地目录装（改代码时）：
+
 ```sh
 pnpm dsh plugin --profile <profile> add ./dieci-compiler
-pnpm dsh plugin --profile <profile> remove dieci-compiler   # 卸载
+```
+
+卸载：
+
+```sh
+pnpm dsh plugin --profile <profile> remove dieci-compiler
 ```
 
 装完重启宿主，会话里就有五个工具、三条命令和一段系统提示。
+
+本插件依赖 DSH 自带的 `@deepseek-ai/dsh-tools` 与 `@deepseek-ai/dsh-llm`，不自己带这两个包；实测于 `0.1.0-rc.5`。
 
 ## 五个工具
 
