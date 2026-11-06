@@ -10,7 +10,7 @@
 pnpm dsh plugin --profile <profile> add github:Mydogsname/dieci-compiler
 ```
 
-从本地目录装（改代码时）:
+从本地目录装（改代码时）：
 
 ```sh
 pnpm dsh plugin --profile <profile> add ./dieci-compiler
