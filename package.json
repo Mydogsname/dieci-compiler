@@ -1,13 +1,29 @@
 {
   "name": "dieci-compiler",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "叠词：总结本地文件生成注释格式的提示词",
   "type": "module",
   "main": "src/index.js",
   "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "prompt",
+    "annotation",
+    "chinese"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitee.com/ddtsc/dieci-dsh.git"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1"
+  },
   "files": [
     "src/**/*.js",
     "cordis.patch.yml",
+    "示例/**",
     "README.md",
     "LICENSE"
   ],

@@ -19,15 +19,10 @@
 
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { makeToolRunner } from '../core/dispatch.js'
+import { OUT_DIR, PLAIN_SUFFIX, REMAIN_SUFFIX, workspaceRoot } from '../core/paths.js'
 import { RECORD_NAME, recordLine, appendRecord } from '../core/record.js'
 import { workspaceName } from '../core/text.js'
-
-/** 工具失败时返回的首行签名：三个工具共用「XX失败：」前缀 */
-const FAIL_LINE = /^(拆解|检查|叠合)失败：/u
-
-/** check_notes 的合格结论（它把「不合格」当正常报告，不算工具失败） */
-const CHECK_PASS = /结论：通过/u
 
 /** 算「正文」的扩展名 */
 const SOURCE_EXT = /\.(md|txt|markdown|text)$/iu
@@ -41,37 +36,7 @@ const SKIP_DIRS = new Set(['语义', '叠词', 'node_modules', '.git', '.pnpm', 
 /** 一次处理的份数上限 */
 const MAX_FILES = 30
 
-/** 注释表目录：<工作区>\叠词\ */
-const OUT_DIR = '叠词'
-
-/** 产物名后缀：前缀是工作区目录名，见 runDieci 里对 workspaceName 的调用 */
-const NOTE_SUFFIX = '-注释.txt'
-const RESIDUAL_SUFFIX = '-剩余.txt'
-
 const USAGE = '用法：/dieci（不接受参数）'
-
-/**
- * 工作区根目录。
- *
- * 三级来源，取第一个可用的：
- *   1. 会话创建时的 cwd —— 这才是「用户的会话工作区」，也是沙箱边界
- *   2. fs 服务的 config.cwd —— 全局解析默认值，通常是进程启动目录
- *   3. process.cwd()
- *
- * @param {object} ctx 带 fs 服务的上下文
- * @param {import('@deepseek-ai/dsh-commands').CommandInvocation} invocation
- * @returns {string} 绝对路径
- */
-function workspaceRoot(ctx, invocation) {
-    const headerCwd = invocation?.agent?.session?.header?.cwd
-    if (typeof headerCwd === 'string' && headerCwd) return headerCwd
-
-    const fsService = typeof ctx.get === 'function' ? ctx.get('fs') : undefined
-    const fxCwd = fsService?.config?.cwd
-    if (typeof fxCwd === 'string' && fxCwd) return fxCwd
-
-    return process.cwd()
-}
 
 /**
  * 递归收集根目录下的正文文件。
@@ -104,30 +69,8 @@ async function collectSources(root) {
     return found
 }
 
-/**
- * 派发一次工具调用，把「工具层面的失败」与「业务层面的结论」分开。
- * @returns {Promise<{ ok: boolean, text: string }>} ok=false 表示该步失败
- */
-async function runTool(ctx, invocation, name, args, seq) {
-    let res
-    try {
-        res = await ctx.tools.execute({
-            callId: CallId(`dieci:${seq}:${name}`),
-            name,
-            arguments: args,
-            agent: invocation.agent,
-            signal: invocation.signal,
-        })
-    } catch (err) {
-        return { ok: false, text: `${name} 调度失败：${err?.message ?? err}` }
-    }
-
-    if (res?.isError) {
-        return { ok: false, text: `${name} 执行失败：${res.error?.message ?? '未知错误'}` }
-    }
-    const text = typeof res?.value === 'string' ? res.value : String(res?.value ?? '')
-    return { ok: !FAIL_LINE.test(text), text }
-}
+/** 派发一次工具调用：与模型直接调用同一套策略、守卫与日志（见 core/dispatch.js） */
+const runTool = makeToolRunner({ prefix: 'dieci' })
 
 /**
  * 串连执行。
@@ -140,7 +83,7 @@ export async function runDieci(ctx, invocation) {
         return { kind: 'error', text: USAGE }
     }
 
-    const root = workspaceRoot(ctx, invocation)
+    const root = workspaceRoot(invocation, ctx)
     const stat = await fs.stat(root).catch(() => null)
     if (!stat?.isDirectory()) return { kind: 'error', text: `工作区目录不存在：${root}` }
 
@@ -159,14 +102,13 @@ export async function runDieci(ctx, invocation) {
 
     const steps = [`扫描根目录：${root}（${targets.length} 份）`]
     const ready = []
-    let seq = 0
 
     // ── 第一段：逐个素材自检，缺/不合格才重拆并复核 ──
     for (const file of targets) {
         const name = path.basename(file)
 
-        const check = await runTool(ctx, invocation, 'check_notes', { file }, ++seq)
-        if (check.ok && CHECK_PASS.test(check.text)) {
+        const check = await runTool(ctx, invocation, 'check_notes', { file })
+        if (check.ok && check.passed === true) {
             steps.push(`· ${name}：语义文件已通过自检，跳过 decompose`)
             ready.push(file)
             continue
@@ -174,7 +116,7 @@ export async function runDieci(ctx, invocation) {
 
         steps.push(`· ${name}：语义文件缺失或未通过自检 → decompose`)
 
-        const dec = await runTool(ctx, invocation, 'decompose', { file }, ++seq)
+        const dec = await runTool(ctx, invocation, 'decompose', { file })
         if (!dec.ok) {
             return {
                 kind: 'error',
@@ -183,8 +125,8 @@ export async function runDieci(ctx, invocation) {
         }
         steps.push(`  ${dec.text.split('\n')[0]}`)
 
-        const recheck = await runTool(ctx, invocation, 'check_notes', { file }, ++seq)
-        if (!recheck.ok || !CHECK_PASS.test(recheck.text)) {
+        const recheck = await runTool(ctx, invocation, 'check_notes', { file })
+        if (!recheck.ok || recheck.passed !== true) {
             return {
                 kind: 'error',
                 text: [`/dieci 中止：${name} 拆解后复核未通过`, '', recheck.text, '', '前序步骤：', ...steps].join('\n'),
@@ -212,14 +154,14 @@ export async function runDieci(ctx, invocation) {
     // 名字前缀取工作区目录名：会话头没有工作区标题，cwd 的目录名就是它唯一的身份
     const name = workspaceName(root)
     const outDir = path.join(root, OUT_DIR)
-    const notePath = path.join(outDir, `${name}${NOTE_SUFFIX}`)
-    const residualPath = path.join(root, `${name}${RESIDUAL_SUFFIX}`)
+    const notePath = path.join(outDir, `${name}${PLAIN_SUFFIX}`)
+    const residualPath = path.join(root, `${name}${REMAIN_SUFFIX}`)
 
     const dieci = await runTool(ctx, invocation, 'dieci', {
         materials: ready,
         out: notePath,
         outResidual: residualPath,
-    }, ++seq)
+    })
 
     if (!dieci.ok) {
         return {

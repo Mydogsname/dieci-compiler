@@ -13,54 +13,13 @@
  *   · 每一步经 ctx.tools.execute 派发，与模型直接调用同一套策略、守卫与日志
  */
 
-import { CallId } from '@deepseek-ai/dsh-llm'
-
-/** 工具失败时返回的首行签名 */
-const FAIL_LINE = /^补充失败：/u
+import { makeToolRunner } from '../core/dispatch.js'
+import { workspaceRoot } from '../core/paths.js'
 
 const USAGE = '用法：/supplement <题目>　例：/supplement 夜间照明的画面约束'
 
-/**
- * 工作区根目录：会话 cwd → fs 服务 config.cwd → process.cwd()
- * @param {object} ctx 带 fs 服务的上下文
- * @param {import('@deepseek-ai/dsh-commands').CommandInvocation} invocation
- * @returns {string} 绝对路径
- */
-function workspaceRoot(ctx, invocation) {
-    const headerCwd = invocation?.agent?.session?.header?.cwd
-    if (typeof headerCwd === 'string' && headerCwd) return headerCwd
-
-    const fsService = typeof ctx.get === 'function' ? ctx.get('fs') : undefined
-    const fxCwd = fsService?.config?.cwd
-    if (typeof fxCwd === 'string' && fxCwd) return fxCwd
-
-    return process.cwd()
-}
-
-/**
- * 派发一次工具调用，把「工具层面的失败」与「业务层面的结论」分开。
- * @returns {Promise<{ ok: boolean, text: string }>}
- */
-async function runTool(ctx, invocation, name, args) {
-    let res
-    try {
-        res = await ctx.tools.execute({
-            callId: CallId(`supplement-cmd:${name}`),
-            name,
-            arguments: args,
-            agent: invocation.agent,
-            signal: invocation.signal,
-        })
-    } catch (err) {
-        return { ok: false, text: `${name} 调度失败：${err?.message ?? err}` }
-    }
-
-    if (res?.isError) {
-        return { ok: false, text: `${name} 执行失败：${res.error?.message ?? '未知错误'}` }
-    }
-    const text = typeof res?.value === 'string' ? res.value : String(res?.value ?? '')
-    return { ok: !FAIL_LINE.test(text), text }
-}
+/** 派发一次工具调用：与模型直接调用同一套策略、守卫与日志（见 core/dispatch.js） */
+const runTool = makeToolRunner({ prefix: 'supplement-cmd' })
 
 /**
  * 执行一次补充。
@@ -72,7 +31,7 @@ export async function runSupplement(ctx, invocation) {
     const topic = String(invocation?.rawInput ?? '').trim()
     if (!topic) return { kind: 'error', text: USAGE }
 
-    const root = workspaceRoot(ctx, invocation)
+    const root = workspaceRoot(invocation, ctx)
     const res = await runTool(ctx, invocation, 'supplement', { input: topic })
     if (!res.ok) {
         return {

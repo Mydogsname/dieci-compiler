@@ -10,6 +10,8 @@
  * 判据按「行位」比对，因此合并、拆分、换序、重复、塞碎片都会被指出来。
  */
 
+import { ILLEGAL_IN_NAME } from './paths.js'
+
 const FENCE = /^```/u
 
 /** 归一化空白：压成一个空格、去首尾、去 BOM */
@@ -176,9 +178,6 @@ export function semanticPathFor(file, path) {
     return path.join(path.dirname(file), '语义', `${sourceBaseName(file)}-语义.txt`)
 }
 
-/** 文件名里不能出现的字符 */
-const ILLEGAL_IN_NAME = /[\\/:*?"<>|\u0000-\u001f]/gu
-
 /**
  * 工作区名字：取根目录的目录名，当作产物的名字前缀。
  * 会话头里没有工作区标题（SessionHeader 只有 cwd），所以名字只能从 cwd 取。
@@ -192,4 +191,107 @@ export function workspaceName(root) {
         .replace(/\s+/gu, ' ')
         .trim()
     return cleaned || '工作区'
+}
+
+/**
+ * 用主题本身当成品文件名：剥掉文件名非法字符，压空白，过长截断。
+ * compose 的缺省落点要用它，命令侧也用它——两边算出的名字必须一致。
+ * @param {string} theme 主题
+ * @returns {string} 干净的文件名片段；主题全被剥光时回落「指定主题」
+ */
+export function themeFileName(theme) {
+    const cleaned = String(theme ?? '')
+        .replace(/[\\/:*?"<>|\u0000-\u001f]/gu, '_')
+        .replace(/\s+/gu, ' ')
+        .trim()
+        .slice(0, 40)
+    return cleaned || '指定主题'
+}
+
+// ─── 主题核对：compose 出成品前校验主题有没有跑出注释表 ───
+
+/** 切主题时不计入成分的字符：标点与空白 */
+const SPAN_NOISE = /[\s。，、；：！？…—－·“”‘’（）《》〈〉「」『』【】,.．;:!?()"'\-]/gu
+
+/**
+ * 主题里「既不是注释词、又没在原料里出现过」的成分。
+ *
+ * 旧规则是「主题含任意一个词就放行」——主题「金鱼配红烧肉」因为含「金鱼」就过了，
+ * 成品随后就敢编红烧肉。这里改成逐段核对：
+ *   1. 从左到右扫主题，能匹配上某个注释词的原样跳过（长词优先，免得「黑色扩散」被「黑色」切碎）；
+ *   2. 连续匹配不上的字聚成一段，去掉标点空白；
+ *   3. 这一段在原料（注释表 + 剩余文本全文）里找得到，就算原料覆盖；
+ *   4. 找不到的才算表外成分，报出来。
+ *
+ * 只报不拦：主题是用户写的，工具只负责告诉用户哪几个字没有依据。
+ *
+ * @param {string} theme 成品首行的主题
+ * @param {string[]} terms 注释表里的词
+ * @param {string} material 原料全文（注释表 + 剩余文本）
+ * @returns {string[]} 表外成分，按出现顺序、去重
+ */
+export function uncoveredSpans(theme, terms, material) {
+    const sorted = [...new Set((terms ?? []).filter(Boolean))].sort((a, b) => b.length - a.length)
+    const spans = []
+    let rest = ''
+
+    for (let i = 0; i < theme.length;) {
+        const hit = sorted.find(t => theme.startsWith(t, i))
+        if (hit) {
+            if (rest) { spans.push(rest); rest = '' }
+            i += hit.length
+            continue
+        }
+        rest += theme[i]
+        i++
+    }
+    if (rest) spans.push(rest)
+
+    const out = []
+    for (const span of spans) {
+        const cleaned = span.replace(SPAN_NOISE, '')
+        if (!cleaned) continue
+        if (material.includes(cleaned)) continue
+        if (!out.includes(cleaned)) out.push(cleaned)
+    }
+    return out
+}
+
+// ─── 正文核对：compose 出成品后查一遍「捏造的禁止项」 ───
+
+/** 否定词：带这些词的句子，改一个字就改变「不能画什么」 */
+const NEGATION = /(?:不要|不能|不得|禁止|避免|排除|勿)[^；。！？\n]*/gu
+
+/** 去掉标点与空白，只留字——两边比对前都走一遍 */
+const plain = s => squash(s).replace(SPAN_NOISE, '')
+
+/**
+ * 正文里「原料中找不到的否定约束」。
+ *
+ * 主题有 uncoveredSpans 对账，正文之前没人管。正文里真正致命的是**捏造的禁止项**：
+ * 实测有一份成品写着「负面提示：排除模糊、畸形、水印等不希望出现的内容；不要人物。」，
+ * 而「不要人物」四个字整份原料里根本没有——它来自 compose 自己的提示词举例，
+ * 被模型当成原料抄了进去（提示词已改，这里是兜底）。
+ *
+ * 一条捏造的否定约束会让图少画东西、让人多删东西，读完不细看根本察觉不到。
+ *
+ * 只比对**否定短语**（否定词后面到句末），不比对整句——compose 补个「用来」之类的
+ * 虚词是允许的，整句比对会把这种正常改写判成编造。
+ * 也不查普通的用词组装：把词拼成句本来就是 compose 的活，那种检查全是噪声。
+ *
+ * @param {string} body 成品正文
+ * @param {string} material 原料全文（注释表 + 剩余文本）
+ * @returns {string[]} 找不到出处的否定短语，去重
+ */
+export function unsourcedConstraints(body, material) {
+    const src = plain(material)
+    const out = []
+
+    for (const [phrase] of String(body ?? '').matchAll(NEGATION)) {
+        const cleaned = plain(phrase)
+        if (cleaned.length < 2) continue
+        if (src.includes(cleaned)) continue
+        if (!out.includes(cleaned)) out.push(cleaned)
+    }
+    return out
 }

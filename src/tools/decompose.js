@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage, BlockAssembler, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { callModel } from '../core/llm.js'
+import { ok, fail, TEXT_OUTPUT } from '../core/result.js'
 import { checkNotes, parseSemantic, renderSemantic, semanticPathFor } from '../core/text.js'
 
 const SYSTEM = `你是语义划分器。把正文按语义分组，只输出列表本身。
@@ -15,98 +16,6 @@ const SYSTEM = `你是语义划分器。把正文按语义分组，只输出列�
 
 /** 重试次数上限（含首次） */
 const MAX_ATTEMPTS = 3
-
-/** 输出上限（含推理），可按需调 */
-const DEFAULT_MAX_TOKENS = 8192
-
-/**
- * 这类「按格式照抄并分组」的任务不需要思考，而推理 token 与正文共享 maxTokens：
- * 会话 reasoningEffort=high 时，模型可能把配额全花在思考上，正文一个字都不剩。
- * 所以显式请求 off；provider 不支持 off 时自动退回默认档。
- */
-const OFF_EFFORT = ReasoningEffortId('off')
-
-/** 该 provider 不认这个推理档位时的报错特征 */
-const EFFORT_REJECTED = /reasoning effort|推理档/i
-
-/**
- * 把一次截断说清楚：上限多少、正文与推理各产出多少字、正文开头是什么。
- * 「被截断」既可能是正文太长，也可能是推理吃光了配额——两者处置完全不同。
- */
-function describeTruncation(blocks, maxTokensUsed) {
-    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
-    const reasoning = blocks.filter(b => b.type === 'reasoning').map(b => b.text).join('')
-    const head = text.slice(0, 300) || '（空）'
-    return [
-        `输出被 maxTokens 截断（上限 ${maxTokensUsed}）：正文 ${text.length} 字，推理 ${reasoning.length} 字。`,
-        reasoning.length > text.length
-            ? '推理占了大部分配额——应关闭思考（reasoningEffort=off）或提高 maxTokens。'
-            : '正文本身过长——请把源文件分段后再拆。',
-        `正文开头：${head}`,
-    ].join('\n')
-}
-
-/** 跑一次流，把「调用失败」与「正常结束」分开。 */
-async function streamOnce(ctx, exec, prompt, reasoningEffort) {
-    const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
-    if (!llm?.stream) return { ok: false, kind: 'no-llm', error: '宿主没有 llm 服务' }
-
-    const route = exec?.agent?.options ?? {}
-    if (!route.provider || !route.model) {
-        return { ok: false, kind: 'no-route', error: '拿不到当前会话的 provider/model' }
-    }
-
-    const maxTokensUsed = route.maxTokens ?? DEFAULT_MAX_TOKENS
-    const messages = [createUserMessage({
-        content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: 'dieci-compiler' },
-    })]
-
-    const assembler = new BlockAssembler()
-    try {
-        for await (const chunk of llm.stream({
-            provider: route.provider,
-            model: route.model,
-            messages,
-            system: SYSTEM,
-            temperature: 0,
-            maxTokens: maxTokensUsed,
-            ...reasoningEffort === undefined ? {} : { reasoningEffort },
-            signal: exec?.signal,
-        })) {
-            assembler.push(chunk)
-        }
-    } catch (err) {
-        return { ok: false, kind: 'threw', error: `模型调用出错：${err?.message ?? err}` }
-    }
-
-    if (assembler.finish?.kind === 'error') {
-        return { ok: false, kind: 'threw', error: `模型调用出错：${assembler.finish.failure?.message ?? '未知错误'}` }
-    }
-    if (assembler.finish?.kind === 'max-tokens') {
-        return { ok: false, kind: 'truncated', error: describeTruncation(assembler.blocks(), maxTokensUsed) }
-    }
-
-    const text = assembler.blocks()
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('')
-    return { ok: true, text }
-}
-
-/** 调模型：先请求 off（不思考），provider 不认这个档位就退回会话默认档。 */
-async function callModel(ctx, exec, prompt) {
-    const first = await streamOnce(ctx, exec, prompt, OFF_EFFORT)
-    if (first.ok) return first
-    if (first.kind !== 'threw' || !EFFORT_REJECTED.test(first.error)) return first
-
-    const second = await streamOnce(ctx, exec, prompt, undefined)
-    if (second.ok) return second
-    return {
-        ok: false,
-        error: `${second.error}\n（注：provider 不接受 reasoningEffort=off，已退回默认档；若仍被截断，说明思考占了预算。）`,
-    }
-}
 
 // ─── 把自检结果写成人话，交回模型重做 ───
 function feedbackFor(report) {
@@ -138,22 +47,19 @@ export function makeDecomposeTool({ ctx } = {}) {
                 description: '被划分的源文件，绝对路径',
             },
         },
-        output: {
-            schema: { type: 'string' },
-            render: (_args, value) => [{ type: 'text', text: value }],
-        },
+        output: TEXT_OUTPUT,
 
         async execute(args, exec) {
             try {
                 const file = String(args?.file ?? '').trim()
-                if (!file) return '拆解失败：缺少 file 参数（被划分的源文件绝对路径）'
-                if (!path.isAbsolute(file)) return `拆解失败：file 必须是绝对路径（${file}）`
+                if (!file) return fail('拆解失败：缺少 file 参数（被划分的源文件绝对路径）')
+                if (!path.isAbsolute(file)) return fail(`拆解失败：file 必须是绝对路径（${file}）`)
 
                 // ── 1. 读正文 ──
                 const raw = await fs.readFile(file, 'utf-8').catch(() => null)
-                if (raw === null) return `拆解失败：文件读不了（${file}）`
+                if (raw === null) return fail(`拆解失败：文件读不了（${file}）`)
                 const body = raw.replace(/^\uFEFF/u, '').trim()
-                if (!body) return `拆解失败：文件没有正文（${file}）`
+                if (!body) return fail(`拆解失败：文件没有正文（${file}）`)
 
                 // ── 2. 调模型 + 自检 + 重试 ──
                 let report = null
@@ -166,8 +72,8 @@ export function makeDecomposeTool({ ctx } = {}) {
                         ? body
                         : `${body}\n\n—— 上一轮输出不合格，问题如下 ——\n${feedbackFor(report)}\n请按格式重做，只输出列表。`
 
-                    const r = await callModel(ctx, exec, prompt)
-                    if (!r.ok) return `拆解失败：${r.error}`
+                    const r = await callModel(ctx, exec, SYSTEM, prompt)
+                    if (!r.ok) return fail(`拆解失败：${r.error}`)
 
                     const lines = parseSemantic(r.text)
                     if (!lines.some(Boolean)) {
@@ -187,11 +93,11 @@ export function makeDecomposeTool({ ctx } = {}) {
                         report?.missing.length ? `覆盖未过：\n` + report.missing.map(l => `  · ${l}`).join('\n') : '',
                         report?.problems.length ? `结构未过：\n` + report.problems.map(l => `  · ${l}`).join('\n') : '',
                     ].filter(Boolean).join('\n')
-                    return [
+                    return fail([
                         `拆解失败：${attempts} 次尝试均未通过自检，未落盘（旧语义文件未改动）`,
                         `源文件：${file}`,
                         detail || '原因未知',
-                    ].join('\n')
+                    ].join('\n'))
                 }
 
                 // ── 4. 落盘 ──
@@ -209,9 +115,9 @@ export function makeDecomposeTool({ ctx } = {}) {
                     `结构：通过（一句一行、组间一个空行）`,
                 ]
                 if (attempts > 1) out.push(`注：第 ${attempts} 次尝试才通过自检`)
-                return out.join('\n')
+                return ok(out.join('\n'))
             } catch (err) {
-                return `拆解失败：${err?.message ?? err}`
+                return fail(`拆解失败：${err?.message ?? err}`)
             }
         },
     })

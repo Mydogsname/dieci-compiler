@@ -1,7 +1,9 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage, BlockAssembler, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { callModel } from '../core/llm.js'
+import { OUT_DIR, PLAIN_SUFFIX, REMAIN_SUFFIX, ILLEGAL_IN_NAME, workspaceRoot } from '../core/paths.js'
+import { ok, fail, TEXT_OUTPUT } from '../core/result.js'
 import { RECORD_NAME, recordLine, appendRecord } from '../core/record.js'
 
 /**
@@ -21,28 +23,9 @@ import { RECORD_NAME, recordLine, appendRecord } from '../core/record.js'
  *   · 与题目无关的句子不引用——它们留在剩余文本里等下一个题目；
  *   · 落盘顺序 = 注释表 → 剩余文本 → 提取记录，任一步失败即停并报明现状。
  */
-const OFF_EFFORT = ReasoningEffortId('off')
-
-/** 输出上限（含推理） */
-const DEFAULT_MAX_TOKENS = 8192
-
-/** 该 provider 不认这个推理档位时的报错特征 */
-const EFFORT_REJECTED = /reasoning effort|推理档/i
-
-/** 注释表落点：<工作区>\叠词\<题目>-注释.txt（题目就是主题，与 dieci 的 <工作区名>-注释.txt 同构） */
-const OUT_DIR = '叠词'
-
-/** 注释表后缀：题目在前，-注释 在后 */
-const NOTE_SUFFIX = '-注释.txt'
-
-/** 剩余文本的文件名后缀 */
-const REMAIN_SUFFIX = '-剩余.txt'
 
 /** 剩余文本行首的（来源文件），只用于保留原样，注释表里不带 */
 const SOURCE_PREFIX = /^（[^）]*）/u
-
-/** 文件名里不能出现的字符 */
-const ILLEGAL_IN_NAME = /[\\/:*?"<>|\u0000-\u001f]/gu
 
 /** 题目过长时截断，给 -注释.txt 后缀留位置 */
 const TITLE_MAX = 60
@@ -58,80 +41,6 @@ const SYSTEM = `用户给你一个题目和一批句子（一句一行，带序�
 - 只报句序号，不抄原句、不解释、不写别的字段。
 
 直接输出 JSON：{ "matches": [属于这个范围的句序号…] }`
-
-/** 把一次截断说清楚：上限多少、正文与推理各产出多少字。 */
-function describeTruncation(blocks, maxTokensUsed) {
-    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
-    const reasoning = blocks.filter(b => b.type === 'reasoning').map(b => b.text).join('')
-    return [
-        `输出被 maxTokens 截断（上限 ${maxTokensUsed}）：正文 ${text.length} 字，推理 ${reasoning.length} 字。`,
-        reasoning.length > text.length
-            ? '推理占了大部分配额——应关闭思考（reasoningEffort=off）或提高 maxTokens。'
-            : '正文本身过长——减少剩余文本或收紧每词的句数。',
-        `正文开头：${text.slice(0, 300) || '（空）'}`,
-    ].join('\n')
-}
-
-/** 跑一次流，把「调用失败」与「正常结束」分开。 */
-async function streamOnce(ctx, exec, system, prompt, reasoningEffort) {
-    const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
-    if (!llm?.stream) return { ok: false, kind: 'no-llm', error: '宿主没有 llm 服务' }
-
-    const route = exec?.agent?.options ?? {}
-    if (!route.provider || !route.model) {
-        return { ok: false, kind: 'no-route', error: '拿不到当前会话的 provider/model' }
-    }
-
-    const maxTokensUsed = route.maxTokens ?? DEFAULT_MAX_TOKENS
-    const messages = [createUserMessage({
-        content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: 'dieci-compiler' },
-    })]
-
-    const assembler = new BlockAssembler()
-    try {
-        for await (const chunk of llm.stream({
-            provider: route.provider,
-            model: route.model,
-            messages,
-            system,
-            temperature: 0,
-            maxTokens: maxTokensUsed,
-            ...reasoningEffort === undefined ? {} : { reasoningEffort },
-            signal: exec?.signal,
-        })) {
-            assembler.push(chunk)
-        }
-    } catch (err) {
-        return { ok: false, kind: 'threw', error: `模型调用出错：${err?.message ?? err}` }
-    }
-
-    if (assembler.finish?.kind === 'error') {
-        return { ok: false, kind: 'threw', error: `模型调用出错：${assembler.finish.failure?.message ?? '未知错误'}` }
-    }
-    if (assembler.finish?.kind === 'max-tokens') {
-        return { ok: false, kind: 'truncated', error: describeTruncation(assembler.blocks(), maxTokensUsed) }
-    }
-
-    return {
-        ok: true,
-        text: assembler.blocks().filter(b => b.type === 'text').map(b => b.text).join('').trim(),
-    }
-}
-
-/** 调模型：先请求 off（不思考），provider 不认这个档位就退回会话默认档。 */
-async function callModel(ctx, exec, system, prompt) {
-    const first = await streamOnce(ctx, exec, system, prompt, OFF_EFFORT)
-    if (first.ok) return first
-    if (first.kind !== 'threw' || !EFFORT_REJECTED.test(first.error)) return first
-
-    const second = await streamOnce(ctx, exec, system, prompt, undefined)
-    if (second.ok) return second
-    return {
-        ok: false,
-        error: `${second.error}\n（注：provider 不接受 reasoningEffort=off，已退回默认档；若仍被截断，说明思考占了预算。）`,
-    }
-}
 
 // ─── 解析 ───
 
@@ -270,13 +179,6 @@ function renderPanel({ title, entry, taken, left, paths, dropped }) {
     return lines.join('\n')
 }
 
-/** 工作区：会话 cwd → process.cwd() */
-function workspaceRoot(exec) {
-    const cwd = exec?.agent?.session?.header?.cwd
-    if (typeof cwd === 'string' && cwd) return cwd
-    return process.cwd()
-}
-
 /** 根目录下的 *-剩余.txt；没有或多于一份都要求显式传 residual。 */
 async function findRemaining(root) {
     return (await fs.readdir(root).catch(() => []))
@@ -321,15 +223,12 @@ export function makeSupplementTool({ ctx } = {}) {
                 description: '提取记录落点（可选，缺省 根目录\\提取记录.txt）',
             },
         },
-        output: {
-            schema: { type: 'string' },
-            render: (_args, value) => [{ type: 'text', text: value }],
-        },
+        output: TEXT_OUTPUT,
 
         async execute(args, exec) {
             try {
                 const input = String(args?.input ?? '').trim()
-                if (!input) return '补充失败：缺少 input（题目来源）'
+                if (!input) return fail('补充失败：缺少 input（题目来源）')
 
                 for (const [key, val] of [
                     ['residual', args?.residual],
@@ -337,32 +236,32 @@ export function makeSupplementTool({ ctx } = {}) {
                     ['outRecord', args?.outRecord],
                 ]) {
                     const v = String(val ?? '').trim()
-                    if (v && !path.isAbsolute(v)) return `补充失败：${key} 必须是绝对路径（${v}）`
+                    if (v && !path.isAbsolute(v)) return fail(`补充失败：${key} 必须是绝对路径（${v}）`)
                 }
 
-                const root = workspaceRoot(exec)
+                const root = workspaceRoot(exec, ctx)
 
                 // ── 1. 定位剩余文本 ──
                 let remainPath = String(args?.residual ?? '').trim()
                 if (!remainPath) {
                     const found = await findRemaining(root)
                     if (!found.length) {
-                        return `补充失败：根目录下没有 *${REMAIN_SUFFIX}（${root}）。请先调用 dieci 生成剩余文本。`
+                        return fail(`补充失败：根目录下没有 *${REMAIN_SUFFIX}（${root}）。请先调用 dieci 生成剩余文本。`)
                     }
                     if (found.length > 1) {
-                        return [
+                        return fail([
                             `补充失败：根目录下有 ${found.length} 份剩余文本，不知道用哪份：`,
                             ...found.map(n => `  · ${n}`),
                             '请用 residual 参数显式指定。',
-                        ].join('\n')
+                        ].join('\n'))
                     }
                     remainPath = path.join(root, found[0])
                 }
 
                 const remain = await readRemaining(remainPath)
-                if (remain === null) return `补充失败：剩余文本读不了（${remainPath}）`
+                if (remain === null) return fail(`补充失败：剩余文本读不了（${remainPath}）`)
                 if (!remain.bare.length) {
-                    return `补充失败：剩余文本是空的（${remainPath}），没有可提取的句子。`
+                    return fail(`补充失败：剩余文本是空的（${remainPath}），没有可提取的句子。`)
                 }
 
                 // ── 2. 一次调用：题目 + 归类 ──
@@ -373,37 +272,37 @@ export function makeSupplementTool({ ctx } = {}) {
                     `【剩余文本】共 ${remain.bare.length} 句`,
                     numbered,
                 ].join('\n'))
-                if (!r.ok) return `补充失败：${r.error}`
+                if (!r.ok) return fail(`补充失败：${r.error}`)
 
                 let parsed
                 try {
                     parsed = parseClaim(r.text)
                 } catch (err) {
-                    return `补充失败：${err?.message ?? err}`
+                    return fail(`补充失败：${err?.message ?? err}`)
                 }
 
                 // ── 3. 题名与落点：题目就是词名，模型无权改写 ──
                 const title = titleFromTopic(input)
-                if (!title) return '补充失败：题目清洗后为空，无法给注释表命名'
+                if (!title) return fail('补充失败：题目清洗后为空，无法给注释表命名')
 
                 const resolved = resolveClaims(remain.bare, parsed.matches, title)
                 const taken = resolved.claimed.size
                 const left = remain.lines.length - taken
 
                 const notePath = String(args?.out ?? '').trim()
-                    || path.join(root, OUT_DIR, `${title}${NOTE_SUFFIX}`)
+                    || path.join(root, OUT_DIR, `${title}${PLAIN_SUFFIX}`)
                 const recordPath = String(args?.outRecord ?? '').trim()
                     || path.join(root, RECORD_NAME)
 
                 if (!resolved.entry) {
-                    return renderPanel({
+                    return ok(renderPanel({
                         title,
                         entry: null,
                         taken,
                         left,
                         paths: { note: notePath, remain: remainPath, record: null },
                         dropped: resolved,
-                    })
+                    }))
                 }
 
                 const annotation = renderAnnotation([resolved.entry])
@@ -414,18 +313,18 @@ export function makeSupplementTool({ ctx } = {}) {
                     await fs.mkdir(path.dirname(notePath), { recursive: true })
                     await fs.writeFile(notePath, annotation, 'utf-8')
                 } catch (err) {
-                    return `补充失败：注释表写不进（${notePath}）\n${err?.message ?? err}\n剩余文本未改动。`
+                    return fail(`补充失败：注释表写不进（${notePath}）\n${err?.message ?? err}\n剩余文本未改动。`)
                 }
 
                 try {
                     await fs.writeFile(remainPath, remainingText, 'utf-8')
                 } catch (err) {
-                    return [
+                    return fail([
                         '补充失败：剩余文本写不回，但注释表已落盘',
                         String(err?.message ?? err),
                         `注释表：${notePath}`,
                         `剩余文本仍是原样：${remainPath}（同一句现在两处都有，下轮 dieci 前请手工核对）`,
-                    ].join('\n')
+                    ].join('\n'))
                 }
 
                 const recorded = await appendRecord(recordPath, recordLine(
@@ -434,16 +333,16 @@ export function makeSupplementTool({ ctx } = {}) {
                     `取走 ${taken} 句\t剩余 ${left} 句`,
                 ))
 
-                return renderPanel({
+                return ok(renderPanel({
                     title,
                     entry: resolved.entry,
                     taken,
                     left,
                     paths: { note: notePath, remain: remainPath, record: recorded ? recordPath : null },
                     dropped: resolved,
-                })
+                }))
             } catch (err) {
-                return `补充失败：${err?.message ?? err}`
+                return fail(`补充失败：${err?.message ?? err}`)
             }
         },
     })

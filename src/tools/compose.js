@@ -1,8 +1,10 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage, BlockAssembler, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { workspaceName } from '../core/text.js'
+import { callModel } from '../core/llm.js'
+import { OUT_DIR, PLAIN_SUFFIX, workspaceRoot } from '../core/paths.js'
+import { ok, fail, TEXT_OUTPUT } from '../core/result.js'
+import { workspaceName, uncoveredSpans, unsourcedConstraints, themeFileName } from '../core/text.js'
 
 /**
  * compose —— 注释表（一份或多份）+ 剩余文本 → 成品。
@@ -21,14 +23,6 @@ import { workspaceName } from '../core/text.js'
  * 给了 theme 就把那句写死当首行，模型只负责把正文写紧扣，不得改主题的措辞。
  */
 
-const OFF_EFFORT = ReasoningEffortId('off')
-
-/** 输出上限（含推理） */
-const DEFAULT_MAX_TOKENS = 8192
-
-/** 该 provider 不认这个推理档位时的报错特征 */
-const EFFORT_REJECTED = /reasoning effort|推理档/i
-
 /** 成品首行的主题行 */
 const THEME_LINE = /^主题[:：]\s*(.+)$/u
 
@@ -41,24 +35,23 @@ const THEME_MAX = 200
 /** 注释里的条目行：顶格的「词：」；缩进行是续行 */
 const ENTRY_LINE = /^([^：:\s][^：:]{0,19})[:：]\s*\S/u
 
-/** 注释表目录名：<工作区>\叠词\ */
-const OUT_DIR = '叠词'
-
-/** 注释表后缀：<题目>-注释.txt，题目即主题 */
-const PLAIN_SUFFIX = '-注释.txt'
-
 /**
  * 成稿器的系统提示。
  * 主题由谁定，决定任务第 1 步是「拟定」还是「照办」：
  *   · givenTheme 为空 —— 模型自己定主题（缺省行为，与旧版输出逐字相同）；
- *   · givenTheme 有值 —— 主题已经定了，模型只负责把正文写紧扣，且不得改主题的措辞。
+ *   · givenTheme 有值 —— 主题已经定了，模型只负责把产物写紧扣，且不得改主题的措辞；
+ *     此时第 2 步不再写死「散文」，产物形态交给模型按主题判断。
  * @param {string} givenTheme 用户指定的主题（已归一）；空串表示由模型自定
  * @returns {string}
  */
 function systemFor(givenTheme) {
     const themeStep = givenTheme
-        ? `1. 主题已由用户指定：「${givenTheme}」。你不要另行拟定，也不要改动它的措辞；正文必须紧扣这个主题。`
+        ? `1. 主题已由用户指定：「${givenTheme}」。你不要另行拟定，也不要改动它的措辞；产物必须紧扣这个主题。`
         : '1. 定主题：一句话，必须由注释里出现过的词组合而成，不许引入注释中没有的实体、风格或情绪。'
+
+    const formStep = givenTheme
+        ? '2. 产物形态由主题决定：先判断这句主题要的是哪种产物，再按那种产物本来的样子写。形态只服从两处依据——主题本身，以及原料里的规格注释；原料里有规格注释就照它，没有就按该产物通常的规矩来。不要预设某一种形态。'
+        : '2. 写成稿正文：一段或几段连贯、可直接使用的中文文字。'
 
     return `你是成稿器。用户给你两块原料，此外没有别的材料。
 
@@ -67,11 +60,11 @@ function systemFor(givenTheme) {
 
 任务：
 ${themeStep}
-2. 写成稿正文：一段或几段连贯、可直接使用的中文文字。
+${formStep}
 
 成稿规则：
 - 只能使用这两块原料里出现过的事实与用词；不得新增人物、物件、风格词、细节或常识。
-- 原料里的否定约束（如「不要人物」「不要现代元素」）必须原样保留其含义，不得丢弃或弱化。
+- 原料里的否定约束必须原样保留其含义，不得丢弃或弱化；原料里没有的约束，一个字都不要加。
 - 注释内部若互相矛盾，选与主题最契合的一支，成稿只表达这一支，不要含混并置。
 - 可以调整语序、合并、补连接词与标点，让文字连贯。
 - 正文里不写标题、不解释、不提到「注释」「剩余文本」「素材」这类元信息。
@@ -79,83 +72,7 @@ ${themeStep}
 **舍弃要说清**：你按主题砍掉了哪一支，就逐条报出来——砍的是什么（原料里的哪个词、哪些句子所属的那一类），为什么砍（与主题或与哪条约束冲突）。没砍就报空数组。这些只进面板给用户看，不进正文。
 
 直接输出 JSON：
-{ "theme": "${givenTheme ? '原样回传用户指定的主题，一个字都不要改' : '主题'}", "body": "成稿正文", "dropped": [ { "what": "被舍弃的部分", "why": "为什么舍弃" } ] }`
-}
-
-/**
- * 把一次截断说清楚：上限多少、正文与推理各产出多少字。
- */
-function describeTruncation(blocks, maxTokensUsed) {
-    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
-    const reasoning = blocks.filter(b => b.type === 'reasoning').map(b => b.text).join('')
-    return [
-        `输出被 maxTokens 截断（上限 ${maxTokensUsed}）：正文 ${text.length} 字，推理 ${reasoning.length} 字。`,
-        reasoning.length > text.length
-            ? '推理占了大部分配额——应关闭思考（reasoningEffort=off）或提高 maxTokens。'
-            : '正文本身过长——减少原料或收紧成稿长度。',
-        `正文开头：${text.slice(0, 300) || '（空）'}`,
-    ].join('\n')
-}
-
-/** 跑一次流，把「调用失败」与「正常结束」分开。 */
-async function streamOnce(ctx, exec, system, prompt, reasoningEffort) {
-    const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
-    if (!llm?.stream) return { ok: false, kind: 'no-llm', error: '宿主没有 llm 服务' }
-
-    const route = exec?.agent?.options ?? {}
-    if (!route.provider || !route.model) {
-        return { ok: false, kind: 'no-route', error: '拿不到当前会话的 provider/model' }
-    }
-
-    const maxTokensUsed = route.maxTokens ?? DEFAULT_MAX_TOKENS
-    const messages = [createUserMessage({
-        content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: 'dieci-compiler' },
-    })]
-
-    const assembler = new BlockAssembler()
-    try {
-        for await (const chunk of llm.stream({
-            provider: route.provider,
-            model: route.model,
-            messages,
-            system,
-            temperature: 0,
-            maxTokens: maxTokensUsed,
-            ...reasoningEffort === undefined ? {} : { reasoningEffort },
-            signal: exec?.signal,
-        })) {
-            assembler.push(chunk)
-        }
-    } catch (err) {
-        return { ok: false, kind: 'threw', error: `模型调用出错：${err?.message ?? err}` }
-    }
-
-    if (assembler.finish?.kind === 'error') {
-        return { ok: false, kind: 'threw', error: `模型调用出错：${assembler.finish.failure?.message ?? '未知错误'}` }
-    }
-    if (assembler.finish?.kind === 'max-tokens') {
-        return { ok: false, kind: 'truncated', error: describeTruncation(assembler.blocks(), maxTokensUsed) }
-    }
-
-    return {
-        ok: true,
-        text: assembler.blocks().filter(b => b.type === 'text').map(b => b.text).join('').trim(),
-    }
-}
-
-/** 调模型：先请求 off（不思考），provider 不认这个档位就退回会话默认档。 */
-async function callModel(ctx, exec, system, prompt) {
-    const first = await streamOnce(ctx, exec, system, prompt, OFF_EFFORT)
-    if (first.ok) return first
-    if (first.kind !== 'threw' || !EFFORT_REJECTED.test(first.error)) return first
-
-    const second = await streamOnce(ctx, exec, system, prompt, undefined)
-    if (second.ok) return second
-    return {
-        ok: false,
-        error: `${second.error}\n（注：provider 不接受 reasoningEffort=off，已退回默认档；若仍被截断，说明思考占了预算。）`,
-    }
+{ "theme": "${givenTheme ? '原样回传用户指定的主题，一个字都不要改' : '主题'}", "body": "${givenTheme ? '产物正文' : '成稿正文'}", "dropped": [ { "what": "被舍弃的部分", "why": "为什么舍弃" } ] }`
 }
 
 /**
@@ -271,13 +188,6 @@ export function themeOf(productText) {
     return splitTheme(productText).theme
 }
 
-/** 工作区：会话 cwd → process.cwd() */
-function workspaceRoot(exec) {
-    const cwd = exec?.agent?.session?.header?.cwd
-    if (typeof cwd === 'string' && cwd) return cwd
-    return process.cwd()
-}
-
 /**
  * 扫 <工作区>\叠词\ 下的注释表，按叠层顺序返回：
  *   先 <工作区名>-注释.txt（dieci 的无题划分：管内容），
@@ -308,15 +218,18 @@ export function makeComposeTool({ ctx } = {}) {
 - note：单份注释表绝对路径，可选，等价于只给一份 notes。
 - residual：剩余文本绝对路径，可选；缺省 <工作区>\\\\<工作区名>-剩余.txt。不存在按「无剩余文本」处理。
 - theme：指定主题，可选。给了就不再让模型自定，成品首行逐字用这句（剥「主题：」前缀、多行压成一行），
-    模型只负责把正文写紧扣；主题里含注释表外的词只面板标注，不阻断。
-- out：成品落盘路径，可选；不传只在返回里给文本。
+    模型只负责把产物写紧扣，产物形态由模型按主题判断（要提示词就出提示词，要文章就出文章）；
+    主题里含注释表外的词只面板标注，不阻断。
+- out：成品落盘路径，可选。**不传就固定落到 <工作区>\\叠词\\<工作区名>[-<主题>].txt**——
+    成品总要落盘，不允许「只返回文本、磁盘上没有」。
 【原料边界】
 - 只有注释表与剩余文本两块，不读源文件、不读语义文件、不重新配对。
 - 成品首行「主题：…」；不给 theme 时主题只能由注释表里出现过的词组成。
 【纪律】
 - 注释表里没有注释条目时直接报错，不猜。
-- 不给 theme 时，主题若含注释表外的成分，面板告警但不改动成品。
-- 给了 theme 时人工指定优先：主题含表外成分只标注，不改写你写的字。`,
+- 主题逐成分核对：先按注释词切，切剩的每段再回原料（注释表 + 剩余文本）里找；找不到的逐条列出。
+- 不给 theme 时，主题含表外成分只面板告警，不改动成品。
+- 给了 theme 时人工指定优先：表外成分只标注，不改写你写的字。`,
         parameters: {
             notes: {
                 type: 'array',
@@ -333,32 +246,38 @@ export function makeComposeTool({ ctx } = {}) {
             },
             theme: {
                 type: 'string',
-                description: '指定主题（可选）：给了就写死成品首行，模型不再自定；含注释表外的词只标注不阻断',
+                description: '指定主题（可选）：给了就写死成品首行，模型不再自定；表外成分逐条标注，不阻断',
             },
             out: {
                 type: 'string',
-                description: '成品落盘路径（可选）',
+                description: '成品落盘路径（可选；缺省 <工作区>\\叠词\\<工作区名>[-<主题>].txt，永远会落盘）',
             },
         },
-        output: {
-            schema: { type: 'string' },
-            render: (_args, value) => [{ type: 'text', text: value }],
-        },
+        output: TEXT_OUTPUT,
 
         async execute(args, exec) {
             try {
-                const outArg = String(args?.out ?? '').trim()
+                let outArg = String(args?.out ?? '').trim()
                 if (outArg && !path.isAbsolute(outArg)) {
-                    return `成稿失败：out 必须是绝对路径（${outArg}）`
+                    return fail(`成稿失败：out 必须是绝对路径（${outArg}）`)
                 }
 
                 // 指定主题：归一后非空才算「用户定了主题」
                 const givenTheme = normalizeTheme(args?.theme)
                 if (givenTheme.length > THEME_MAX) {
-                    return `成稿失败：theme 太长（上限 ${THEME_MAX} 字，收到 ${givenTheme.length} 字）`
+                    return fail(`成稿失败：theme 太长（上限 ${THEME_MAX} 字，收到 ${givenTheme.length} 字）`)
                 }
 
-                const root = workspaceRoot(exec)
+                const root = workspaceRoot(exec, ctx)
+
+                // 成品固定落到 <工作区>\叠词\ 下；没给 out 就按主题算一个。
+                // out 若是可选且真跳过写盘，调用方漏一次就只在返回里给文本、磁盘上什么都没有。
+                if (!outArg) {
+                    const name = givenTheme
+                        ? `${workspaceName(root)}-${themeFileName(givenTheme)}`
+                        : workspaceName(root)
+                    outArg = path.join(root, OUT_DIR, `${name}.txt`)
+                }
 
                 // ── 1. 定注释表：显式传入的优先，否则扫 叠词\ ──
                 const given = []
@@ -367,13 +286,13 @@ export function makeComposeTool({ ctx } = {}) {
                     for (const p of arr) {
                         const v = String(p ?? '').trim()
                         if (!v) continue
-                        if (!path.isAbsolute(v)) return `成稿失败：notes 里必须全是绝对路径（${v}）`
+                        if (!path.isAbsolute(v)) return fail(`成稿失败：notes 里必须全是绝对路径（${v}）`)
                         given.push(v)
                     }
                 }
                 const single = String(args?.note ?? '').trim()
                 if (single) {
-                    if (!path.isAbsolute(single)) return `成稿失败：note 必须是绝对路径（${single}）`
+                    if (!path.isAbsolute(single)) return fail(`成稿失败：note 必须是绝对路径（${single}）`)
                     given.push(single)
                 }
 
@@ -381,7 +300,7 @@ export function makeComposeTool({ ctx } = {}) {
                 if (!notePaths.length) {
                     notePaths = await scanNotes(root)
                     if (!notePaths.length) {
-                        return `成稿失败：${path.join(root, OUT_DIR)} 下没有任何注释表（*-注释.txt）。请先跑 /dieci 或 /supplement。`
+                        return fail(`成稿失败：${path.join(root, OUT_DIR)} 下没有任何注释表（*-注释.txt）。请先跑 /dieci 或 /supplement。`)
                     }
                 }
                 notePaths = [...new Set(notePaths)]
@@ -390,20 +309,20 @@ export function makeComposeTool({ ctx } = {}) {
                 const parts = []
                 for (const p of notePaths) {
                     const raw = await fs.readFile(p, 'utf-8').catch(() => null)
-                    if (raw === null) return `成稿失败：注释表读不了（${p}）`
-                    if (!raw.trim()) return `成稿失败：注释表是空的（${p}）`
+                    if (raw === null) return fail(`成稿失败：注释表读不了（${p}）`)
+                    if (!raw.trim()) return fail(`成稿失败：注释表是空的（${p}）`)
                     parts.push({ path: p, text: raw.trim() })
                 }
 
                 const allTerms = [...new Set(parts.flatMap(p => noteTerms(p.text)))]
                 if (!allTerms.length) {
-                    return `成稿失败：注释表里没有注释条目（${notePaths.join('、')}）。请先跑 /dieci 或 /supplement。`
+                    return fail(`成稿失败：注释表里没有注释条目（${notePaths.join('、')}）。请先跑 /dieci 或 /supplement。`)
                 }
 
                 // ── 3. 读剩余文本（缺省 <工作区>\<工作区名>-剩余.txt；不存在按空处理）──
                 let residualPath = String(args?.residual ?? '').trim()
                 if (residualPath && !path.isAbsolute(residualPath)) {
-                    return `成稿失败：residual 必须是绝对路径（${residualPath}）`
+                    return fail(`成稿失败：residual 必须是绝对路径（${residualPath}）`)
                 }
                 if (!residualPath) residualPath = path.join(root, `${workspaceName(root)}-剩余.txt`)
 
@@ -418,23 +337,26 @@ export function makeComposeTool({ ctx } = {}) {
                 ].filter(Boolean).join('\n')
 
                 const r = await callModel(ctx, exec, systemFor(givenTheme), prompt)
-                if (!r.ok) return `成稿失败：${r.error}`
+                if (!r.ok) return fail(`成稿失败：${r.error}`)
 
                 // ── 5. 解析成品：主题 + 正文 + 舍弃清单 ──
                 const { theme: modelTheme, body, dropped, json } = parseProduct(r.text)
-                if (!body) return `成稿失败：模型没有给出正文\n原始输出：${r.text.slice(0, 400)}`
+                if (!body) return fail(`成稿失败：模型没有给出正文\n原始输出：${r.text.slice(0, 400)}`)
 
                 // 主题优先用用户指定的那句，一个字不改
                 const theme = givenTheme || modelTheme
                 const productText = theme ? `主题：${theme}\n\n${body}\n` : body + '\n'
 
-                // ── 6. 落盘 ──
-                if (outArg) {
+                // ── 6. 落盘（outArg 此时一定有值）──
+                try {
                     await fs.mkdir(path.dirname(outArg), { recursive: true })
                     await fs.writeFile(outArg, productText, 'utf-8')
+                } catch (err) {
+                    return fail(`成稿失败：成品写不进（${outArg}）\n${err?.message ?? err}\n正文见下：\n\n${productText}`)
                 }
 
                 // ── 7. 回报 ──
+                const material = [...parts.map(p => p.text), residualText].join('\n')
                 const notes = []
                 if (!json) notes.push('模型没按 JSON 输出，舍弃清单缺失（其余照常）')
                 if (givenTheme && modelTheme && !sameTheme(givenTheme, modelTheme)) {
@@ -442,13 +364,20 @@ export function makeComposeTool({ ctx } = {}) {
                 }
                 if (!theme) notes.push('主题既没有指定、模型也没给出，成品只有正文')
                 else {
-                    const stray = allTerms.length && !allTerms.some(t => theme.includes(t))
-                    if (stray) {
+                    const stray = uncoveredSpans(theme, allTerms, material)
+                    if (stray.length) {
                         notes.push(givenTheme
-                            ? `主题含注释表外的成分（成稿可能据此编造），已按你给的原文落盘：${theme}`
-                            : `主题未包含任何注释里的词，请核对：${theme}`)
+                            ? `主题里这些成分注释表和剩余文本都没有（成稿可能据此编造），已按你给的原文落盘：${stray.join('、')}`
+                            : `主题里这些成分注释表和剩余文本都没有，请核对：${stray.join('、')}`)
                     }
                 }
+
+                // 正文核对：主题对过账了，捏造的禁止项也要对——它会改变「不能画什么」
+                const unsourced = unsourcedConstraints(body, material)
+                if (unsourced.length) {
+                    notes.push(`正文里这些否定约束原料中找不到（可能是编造的，请核对）：${unsourced.join(' / ')}`)
+                }
+
                 if (!residualText) notes.push(`无剩余文本，原料只有注释表（${residualPath} 不存在）`)
 
                 const droppedLines = dropped.length
@@ -461,17 +390,17 @@ export function makeComposeTool({ ctx } = {}) {
                     ]
                     : ['', '舍弃：无（原料全部用上）']
 
-                return [
+                return ok([
                     productText.trimEnd(),
                     '',
-                    `已落盘：${outArg || '（未指定 out，仅返回文本）'}`,
+                    `已落盘：${outArg}`,
                     `原料：${parts.length} 层注释（${parts.map(p => path.basename(p.path)).join(' / ')}）${residualText ? ' + 剩余文本' : ''}`,
                     `主题：${givenTheme ? '用户指定' : modelTheme ? '模型自定' : '无'}`,
                     ...droppedLines,
                     ...notes.map(n => `注：${n}`),
-                ].join('\n')
+                ].join('\n'))
             } catch (err) {
-                return `成稿失败：${err?.message ?? err}`
+                return fail(`成稿失败：${err?.message ?? err}`)
             }
         },
     })

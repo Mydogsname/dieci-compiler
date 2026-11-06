@@ -1,0 +1,13 @@
+# 依赖
+node_modules/
+
+# 运行产物：在哪个目录跑 /dieci，哪个目录就会长出这些
+语义/
+叠词/
+*-剩余.txt
+提取记录.txt
+
+# 杂项
+.DS_Store
+Thumbs.db
+*.log

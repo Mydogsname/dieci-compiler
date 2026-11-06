@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage, BlockAssembler, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { callModel } from '../core/llm.js'
+import { ok, fail, TEXT_OUTPUT } from '../core/result.js'
 import { checkNotes, semanticPathFor } from '../core/text.js'
 
 /**
@@ -21,7 +22,6 @@ import { checkNotes, semanticPathFor } from '../core/text.js'
  * 推理档位：这类任务不需要思考，而推理 token 与正文共享 maxTokens——会话
  * reasoningEffort=high 时模型会把配额全花在思考上。所以显式请求 off，不支持则回退。
  */
-const OFF_EFFORT = ReasoningEffortId('off')
 
 const SYSTEM_MATCH = `你是叠词器。读多份已编号的语义文件，跨文件建立词与句子的关联。
 
@@ -32,101 +32,21 @@ const SYSTEM_MATCH = `你是叠词器。读多份已编号的语义文件，跨�
 2. 词必须能在原句里看到依据，不得凭空编造。
 3. 一个词至少要有 2 条配对，否则不收录——单条依据只是标签，不是关联。
 4. 同一实体的不同侧面合并成一个词，不许把一个实体拆成多个词。
-5. 词的依据必须是句子在讲什么，不能只是句中出现过这个词的字面。
-6. 对每个词，在其他素材里找语义相关的句子，也找本素材内相关的句子。
-7. 相关性按语义判断，不只看字符串是否相同。
-8. 引用句子只写序号：{"src": 素材序号, "s": 句序号}。绝不要抄写原句。
-9. 同一句最多归到一个词下，不要跨词重复引用。
-10. 量的上限：最多 15 个词，每个词最多 5 条配对。宁少不滥。
-11. 直接输出 JSON 本身：不解释、不写过渡句、不复述规则。
+5. 词的依据是句子在讲什么，不是句中出现过这个词的字面。
+6. 「讲什么」取陈述对象，不取句子的语法主语。本体承前省略的，认前面被描述的那个东西为陈述对象，不按喻体的字面算。
+   比喻、通感都按这个口径：喻体与本体本就不是一回事，喻体只是用来讲本体的；只要陈述对象相同，就算同指。
+7. 对每个词，在其他素材里找语义相关的句子，也找本素材内相关的句子。
+8. 相关性按语义判断，不只看字符串是否相同。
+9. 引用句子只写序号：{"src": 素材序号, "s": 句序号}。绝不要抄写原句。
+10. 同一句最多归到一个词下，不要跨词重复引用。
+11. 量的上限：最多 15 个词，每个词最多 5 条配对。宁少不滥。
+12. 直接输出 JSON 本身：不解释、不写过渡句、不复述规则。
 
 输出字段：
 - entries：array，每项 { "term": 词, "matches": [{ "src": 素材序号, "s": 句序号 }] }
 - ambiguities：array，每项 { "part": 有歧义的部分, "could_mean": [可能的意思] }`
 
 const DIRECTIONS = ['entity', 'topic', 'attribute']
-
-/** 输出上限（含推理） */
-const DEFAULT_MAX_TOKENS = 8192
-
-/** 该 provider 不认这个推理档位时的报错特征 */
-const EFFORT_REJECTED = /reasoning effort|推理档/i
-
-/**
- * 把一次截断说清楚：上限多少、正文与推理各产出多少字。
- */
-function describeTruncation(blocks, maxTokensUsed) {
-    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('')
-    const reasoning = blocks.filter(b => b.type === 'reasoning').map(b => b.text).join('')
-    return [
-        `输出被 maxTokens 截断（上限 ${maxTokensUsed}）：正文 ${text.length} 字，推理 ${reasoning.length} 字。`,
-        reasoning.length > text.length
-            ? '推理占了大部分配额——应关闭思考（reasoningEffort=off）或提高 maxTokens。'
-            : '正文本身过长——减少素材或收紧每词的配对数。',
-        `正文开头：${text.slice(0, 300) || '（空）'}`,
-    ].join('\n')
-}
-
-/** 跑一次流，把「调用失败」与「正常结束」分开。 */
-async function streamOnce(ctx, exec, system, prompt, reasoningEffort) {
-    const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
-    if (!llm?.stream) return { ok: false, kind: 'no-llm', error: '宿主没有 llm 服务' }
-
-    const route = exec?.agent?.options ?? {}
-    if (!route.provider || !route.model) {
-        return { ok: false, kind: 'no-route', error: '拿不到当前会话的 provider/model' }
-    }
-
-    const maxTokensUsed = route.maxTokens ?? DEFAULT_MAX_TOKENS
-    const messages = [createUserMessage({
-        content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: 'dieci-compiler' },
-    })]
-
-    const assembler = new BlockAssembler()
-    try {
-        for await (const chunk of llm.stream({
-            provider: route.provider,
-            model: route.model,
-            messages,
-            system,
-            temperature: 0,
-            maxTokens: maxTokensUsed,
-            ...reasoningEffort === undefined ? {} : { reasoningEffort },
-            signal: exec?.signal,
-        })) {
-            assembler.push(chunk)
-        }
-    } catch (err) {
-        return { ok: false, kind: 'threw', error: `模型调用出错：${err?.message ?? err}` }
-    }
-
-    if (assembler.finish?.kind === 'error') {
-        return { ok: false, kind: 'threw', error: `模型调用出错：${assembler.finish.failure?.message ?? '未知错误'}` }
-    }
-    if (assembler.finish?.kind === 'max-tokens') {
-        return { ok: false, kind: 'truncated', error: describeTruncation(assembler.blocks(), maxTokensUsed) }
-    }
-
-    return {
-        ok: true,
-        text: assembler.blocks().filter(b => b.type === 'text').map(b => b.text).join('').trim(),
-    }
-}
-
-/** 调模型：先请求 off（不思考），provider 不认这个档位就退回会话默认档。 */
-async function callModel(ctx, exec, system, prompt) {
-    const first = await streamOnce(ctx, exec, system, prompt, OFF_EFFORT)
-    if (first.ok) return first
-    if (first.kind !== 'threw' || !EFFORT_REJECTED.test(first.error)) return first
-
-    const second = await streamOnce(ctx, exec, system, prompt, undefined)
-    if (second.ok) return second
-    return {
-        ok: false,
-        error: `${second.error}\n（注：provider 不接受 reasoningEffort=off，已退回默认档；若仍被截断，说明思考占了预算。）`,
-    }
-}
 
 // ─── 解析 JSON ───
 function parsePairs(raw) {
@@ -325,34 +245,31 @@ export function makeDieciTool({ ctx } = {}) {
                 description: '剩余文本文件落盘路径（可选）',
             },
         },
-        output: {
-            schema: { type: 'string' },
-            render: (_args, value) => [{ type: 'text', text: value }],
-        },
+        output: TEXT_OUTPUT,
 
         async execute(args, exec) {
             try {
                 const materials = args?.materials ?? []
                 if (!Array.isArray(materials) || materials.length < 2) {
-                    return '叠合失败：至少需要 2 份素材文件'
+                    return fail('叠合失败：至少需要 2 份素材文件')
                 }
                 if (materials.some(p => !path.isAbsolute(String(p ?? '').trim()))) {
-                    return '叠合失败：materials 里必须全是绝对路径'
+                    return fail('叠合失败：materials 里必须全是绝对路径')
                 }
 
                 const direction = String(args?.direction ?? '').trim()
                 if (direction && !DIRECTIONS.includes(direction)) {
-                    return `叠合失败：direction 只能是 ${DIRECTIONS.join(' / ')}，收到「${direction}」`
+                    return fail(`叠合失败：direction 只能是 ${DIRECTIONS.join(' / ')}，收到「${direction}」`)
                 }
 
                 const outNote = String(args?.out ?? '').trim()
                 if (outNote && !path.isAbsolute(outNote)) {
-                    return `叠合失败：out 必须是绝对路径（${outNote}）`
+                    return fail(`叠合失败：out 必须是绝对路径（${outNote}）`)
                 }
 
                 let outResidual = String(args?.outResidual ?? '').trim()
                 if (outResidual && !path.isAbsolute(outResidual)) {
-                    return `叠合失败：outResidual 必须是绝对路径（${outResidual}）`
+                    return fail(`叠合失败：outResidual 必须是绝对路径（${outResidual}）`)
                 }
                 if (!outResidual && outNote) {
                     const base = path.basename(outNote).replace(/\.txt$/iu, '')
@@ -366,24 +283,24 @@ export function makeDieciTool({ ctx } = {}) {
                     const semPath = semanticPathFor(abs, path)
                     const semRaw = await fs.readFile(semPath, 'utf-8').catch(() => null)
                     if (semRaw === null) {
-                        return `叠合失败：${abs} 的语义文件不存在（${semPath}）。请先调用 decompose 生成。`
+                        return fail(`叠合失败：${abs} 的语义文件不存在（${semPath}）。请先调用 decompose 生成。`)
                     }
                     if (!semRaw.trim()) {
-                        return `叠合失败：${abs} 的语义文件为空（${semPath}）。请重新调用 decompose。`
+                        return fail(`叠合失败：${abs} 的语义文件为空（${semPath}）。请重新调用 decompose。`)
                     }
 
                     const srcRaw = await fs.readFile(abs, 'utf-8').catch(() => null)
-                    if (srcRaw === null) return `叠合失败：源文件读不了（${abs}）`
+                    if (srcRaw === null) return fail(`叠合失败：源文件读不了（${abs}）`)
 
                     const r = checkNotes(srcRaw, semRaw)
                     if (!r.ok) {
-                        return [
+                        return fail([
                             `叠合失败：${abs} 的语义文件检查未通过`,
                             r.bad.length ? `保真：${r.bad.length} 行对不上源文\n` + r.bad.map(l => `  · ${l}`).join('\n') : '',
                             r.missing.length ? `覆盖：缺 ${r.missing.length} 句\n` + r.missing.map(s => `  · ${s}`).join('\n') : '',
                             r.problems.length ? `结构：${r.problems.length} 处问题\n` + r.problems.map(s => `  · ${s}`).join('\n') : '',
                             '请重新调用 decompose 生成。',
-                        ].filter(Boolean).join('\n')
+                        ].filter(Boolean).join('\n'))
                     }
 
                     loaded.push({ name: path.basename(abs), lines: r.lines })
@@ -402,13 +319,13 @@ export function makeDieciTool({ ctx } = {}) {
                     : '未指定配对维度。请从素材推断最合适的配对维度。'
 
                 const r = await callModel(ctx, exec, SYSTEM_MATCH, `${directionLine}\n\n${materialsText}`)
-                if (!r.ok) return `叠合失败：${r.error}`
+                if (!r.ok) return fail(`叠合失败：${r.error}`)
 
                 let parsed
                 try {
                     parsed = parsePairs(r.text)
                 } catch (err) {
-                    return `叠合失败：${err?.message ?? err}`
+                    return fail(`叠合失败：${err?.message ?? err}`)
                 }
 
                 const resolved = resolveRefs(loaded, parsed)
@@ -427,9 +344,9 @@ export function makeDieciTool({ ctx } = {}) {
                 }
 
                 const panel = renderPanel(loaded, resolved, leftovers, { outNote, outResidual })
-                if (outNote) return panel
+                if (outNote) return ok(panel)
 
-                return [
+                return ok([
                     panel,
                     '',
                     '—— 注释 ——',
@@ -437,9 +354,9 @@ export function makeDieciTool({ ctx } = {}) {
                     '',
                     '—— 剩余文本 ——',
                     residual.trimEnd() || '（空）',
-                ].join('\n')
+                ].join('\n'))
             } catch (err) {
-                return `叠合失败：${err?.message ?? err}`
+                return fail(`叠合失败：${err?.message ?? err}`)
             }
         },
     })
