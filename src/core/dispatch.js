@@ -1,4 +1,4 @@
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 
 /**
  * 派发一次插件内工具调用，把「工具层面的失败」与「业务层面的结论」分开。
@@ -20,7 +20,7 @@ export function makeToolRunner({ prefix }) {
         let res
         try {
             res = await ctx.tools.execute({
-                callId: CallId(`${prefix}:${++seq}:${name}`),
+                callId: ToolCallId(`${prefix}:${++seq}:${name}`),
                 name,
                 arguments: args,
                 agent: invocation.agent,
